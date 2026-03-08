@@ -1,0 +1,76 @@
+listen: ":8080"
+service: "airlock-firewall-test"
+agent_id: "fw-agent"
+
+providers:
+  env: {}
+
+routes:
+  # Route 1: strict allow-only (like OpenAI — only POST to completions)
+  - path_prefix: "/strict"
+    upstream: "https://httpbin.org"
+    strip_prefix: "/strict"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "TOKEN"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - action: ALLOW
+        method: POST
+        path: /post
+      - action: ALLOW
+        method: GET
+        path: /headers
+
+  # Route 2: deny-then-allow (block destructive, allow rest)
+  - path_prefix: "/open"
+    upstream: "https://httpbin.org"
+    strip_prefix: "/open"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "TOKEN"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - action: DENY
+        method: DELETE
+        path: /**
+      - action: DENY
+        method: PUT
+        path: /**
+      - action: DENY
+        method: ALL
+        path: /admin/**
+      - action: ALLOW
+        method: ALL
+        path: /**
+
+  # Route 3: GitHub-style (narrow denies, then selective allows)
+  - path_prefix: "/gh"
+    upstream: "https://httpbin.org"
+    strip_prefix: "/gh"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "TOKEN"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - action: DENY
+        method: ALL
+        path: /anything/settings
+      - action: DENY
+        method: DELETE
+        path: /anything/**
+      - action: ALLOW
+        method: GET
+        path: /anything/**
+      - action: ALLOW
+        method: GET
+        path: /headers

@@ -1,0 +1,45 @@
+# Anthropic with a setup token — proxying Claude Code through Airlock.
+#
+# The setup token uses OAuth-style auth (Authorization: Bearer) with
+# required anthropic-beta and anthropic-version headers.
+#
+# Run:
+#   ANTHROPIC_SETUP_TOKEN=... airlock -config examples/anthropic-strip-auth.yaml
+#
+# Agent usage:
+#   export ANTHROPIC_BASE_URL=http://localhost:8080/anthropic
+#   export ANTHROPIC_API_KEY=dummy  # stripped by Airlock
+
+listen: ":8080"
+service: "claude-code-proxy"
+
+providers:
+  env: {}
+
+routes:
+  - path_prefix: "/anthropic"
+    upstream: "https://api.anthropic.com"
+    strip_prefix: "/anthropic"
+    strip_agent_auth: true
+    extra_headers:
+      anthropic-beta: "oauth-2025-04-20"
+      anthropic-version: "2023-06-01"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "ANTHROPIC_SETUP_TOKEN"
+      header: "Authorization"
+      prefix: "Bearer "
+    timeout: "300s"
+    idle_timeout: "120s"
+    rate_limit:
+      rps: 5
+      burst: 10
+    access_rules:
+      - action: ALLOW
+        method: POST
+        path: /v1/messages
+      - action: ALLOW
+        method: POST
+        path: /v1/messages/count_tokens

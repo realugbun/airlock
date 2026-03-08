@@ -1,0 +1,61 @@
+# Example Helm values for deploying Airlock on Kubernetes.
+#
+# Install:
+#   helm install airlock deploy/helm/airlock -f examples/helm-values.yaml
+#
+# Prerequisites:
+#   kubectl create secret generic openai-key --from-literal=api-key=sk-...
+
+gateway:
+  image:
+    repository: ghcr.io/realugbun/airlock
+    tag: "0.1.0"
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 64Mi
+  terminationGracePeriodSeconds: 305
+
+  env:
+    - name: OPENAI_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: openai-key
+          key: api-key
+
+  config:
+    listen: ":8080"
+    service: "my-agent"
+    providers:
+      env: {}
+    routes:
+      - path_prefix: "/openai"
+        upstream: "https://api.openai.com"
+        strip_prefix: "/openai"
+        auth:
+          type: static
+          token:
+            from: env
+            key: "OPENAI_API_KEY"
+          header: "Authorization"
+          prefix: "Bearer "
+        timeout: "300s"
+        idle_timeout: "60s"
+        rate_limit:
+          rps: 10
+          burst: 20
+        access_rules:
+          - action: ALLOW
+            method: POST
+            path: /v1/chat/completions
+          - action: ALLOW
+            method: POST
+            path: /v1/embeddings
+
+networkPolicy:
+  enabled: true
+  allowExternalHTTPS: true

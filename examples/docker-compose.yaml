@@ -1,0 +1,40 @@
+# Docker Compose with network isolation.
+#
+# The agent sits on an internal network with no internet access.
+# Airlock bridges both networks — the agent can only reach external
+# APIs through Airlock.
+#
+# Usage:
+#   OPENAI_API_KEY=sk-... docker compose -f examples/docker-compose.yaml up
+
+services:
+  agent:
+    image: your-agent-image
+    networks:
+      - isolated
+    environment:
+      - API_BASE_URL=http://gateway:8080
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  gateway:
+    image: ghcr.io/realugbun/airlock:0.1.0
+    networks:
+      - isolated
+      - external
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./openai-static.yaml:/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "/airlock", "-healthcheck"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+networks:
+  isolated:
+    internal: true    # no outbound internet
+  external:
+    driver: bridge

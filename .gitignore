@@ -1,0 +1,9 @@
+bin/
+/airlock
+coverage.out
+coverage.html
+*.env
+.env
+*.key
+*.pem
+.claude/

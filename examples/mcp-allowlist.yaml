@@ -1,0 +1,37 @@
+# MCP server proxy with a strict tool allowlist.
+# Only the listed tools are permitted; all others are denied.
+# Agents only see allowed tools in tools/list responses.
+#
+# Run:
+#   MCP_API_KEY=... airlock -config examples/mcp-allowlist.yaml
+
+listen: ":8080"
+service: "mcp-proxy"
+
+providers:
+  env: {}
+
+routes:
+  - path_prefix: "/mcp"
+    upstream: "http://localhost:3000"
+    strip_prefix: "/mcp"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "MCP_API_KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - action: ALLOW
+        method: POST
+        path: /
+      - action: ALLOW
+        method: GET
+        path: /sse
+    mcp_rules:
+      allowed_tools:
+        - get_events
+        - list_calendars
+        - search_emails
+        - "calendar_*"       # glob: all tools starting with calendar_

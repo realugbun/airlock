@@ -1,0 +1,77 @@
+gateway:
+  image:
+    repository: ghcr.io/realugbun/airlock
+    tag: "0.1.0"
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 64Mi
+
+  # Optional environment variables for the gateway container.
+  # Useful for injecting secrets from k8s Secrets:
+  #   env:
+  #     - name: API_KEY
+  #       valueFrom:
+  #         secretKeyRef:
+  #           name: my-secret
+  #           key: api-key
+  env: []
+
+  # Must be >= the longest route timeout so in-flight LLM requests can
+  # complete during pod shutdown. Default matches the 300s request timeout
+  # plus a small buffer.
+  terminationGracePeriodSeconds: 305
+
+  config:
+    listen: ":8080"
+    service: "my-agent"
+    providers:
+      env: {}
+    routes:
+      - path_prefix: "/openai"
+        upstream: "https://api.openai.com"
+        strip_prefix: "/openai"
+        auth:
+          type: static
+          token:
+            from: env
+            key: "OPENAI_API_KEY"
+          header: "Authorization"
+          prefix: "Bearer "
+        timeout: "300s"
+        idle_timeout: "60s"
+        rate_limit:
+          rps: 10
+          burst: 20
+        access_rules:
+          - action: ALLOW
+            method: POST
+            path: /v1/chat/completions
+          - action: ALLOW
+            method: POST
+            path: /v1/embeddings
+
+vault:
+  enabled: false
+  role: "airlock"
+
+networkPolicy:
+  enabled: true
+  # Allow gateway to reach external HTTPS APIs (0.0.0.0/0 minus RFC1918).
+  allowExternalHTTPS: true
+  # Namespace containing an OTEL collector for telemetry export (port 4317).
+  # Set to "" to disable the telemetry egress rule.
+  telemetryNamespace: ""
+  # Additional egress rules for the gateway (e.g. internal services).
+  # Each entry needs at least one of: namespace, cidr. Port is required.
+  #   extraEgress:
+  #     - namespace: my-namespace
+  #       port: 5432
+  #     - cidr: 192.168.1.0/24
+  #       port: 8080
+  #       protocol: TCP
+  extraEgress: []

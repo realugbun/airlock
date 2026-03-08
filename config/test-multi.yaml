@@ -1,0 +1,82 @@
+listen: ":8080"
+service: "airlock-multi-test"
+agent_id: "multi-agent-01"
+
+providers:
+  env: {}
+  file: {}
+  envfile:
+    path: "/secrets/credentials.env"
+
+routes:
+  # Route 1: env provider — httpbin.org, method + glob filtering
+  - path_prefix: "/httpbin"
+    upstream: "https://httpbin.org"
+    strip_prefix: "/httpbin"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "HTTPBIN_TOKEN"
+      header: "Authorization"
+      prefix: "Bearer "
+    rate_limit:
+      rps: 10
+      burst: 15
+    access_rules:
+      - action: ALLOW
+        method: GET
+        path: /headers
+      - action: ALLOW
+        method: GET
+        path: /get
+      - action: ALLOW
+        method: GET
+        path: /status/*
+      - action: ALLOW
+        method: POST
+        path: /post
+      - action: ALLOW
+        method: GET
+        path: /anything/**
+
+  # Route 2: file provider — postman-echo
+  - path_prefix: "/echo"
+    upstream: "https://postman-echo.com"
+    strip_prefix: "/echo"
+    auth:
+      type: static
+      token:
+        from: file
+        path: "/secrets/echo-token.txt"
+      header: "X-Api-Key"
+      prefix: ""
+    access_rules:
+      - action: ALLOW
+        method: GET
+        path: /get
+      - action: ALLOW
+        method: ALL
+        path: /time/**
+
+  # Route 3: envfile provider — httpbin.org with different token
+  - path_prefix: "/api"
+    upstream: "https://httpbin.org"
+    strip_prefix: "/api"
+    auth:
+      type: static
+      token:
+        from: envfile
+        key: "API_SECRET"
+      header: "X-Custom-Auth"
+      prefix: "Token "
+    access_rules:
+      - action: ALLOW
+        method: GET
+        path: /headers
+      - action: ALLOW
+        method: GET
+        path: /ip
+      - action: ALLOW
+        method: GET
+        path: /user-agent

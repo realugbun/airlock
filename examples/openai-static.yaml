@@ -1,0 +1,40 @@
+# OpenAI with a static API key from an environment variable.
+#
+# Run:
+#   OPENAI_API_KEY=sk-... airlock -config examples/openai-static.yaml
+#
+# Agent usage:
+#   client = OpenAI(base_url="http://localhost:8080/openai/v1", api_key="unused")
+
+listen: ":8080"
+service: "my-agent"
+
+providers:
+  env: {}
+
+routes:
+  - path_prefix: "/openai"
+    upstream: "https://api.openai.com"
+    strip_prefix: "/openai"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "OPENAI_API_KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+    timeout: "300s"
+    idle_timeout: "60s"
+    rate_limit:
+      rps: 10
+      burst: 20
+    access_rules:
+      - action: ALLOW
+        method: POST
+        path: /v1/chat/completions
+      - action: ALLOW
+        method: POST
+        path: /v1/embeddings
+      - action: ALLOW
+        method: GET
+        path: /v1/models

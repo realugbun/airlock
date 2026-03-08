@@ -1,0 +1,39 @@
+services:
+  # ─── The Agent ───
+  # Only has access to the isolated network.
+  # Cannot reach the internet, Vault, or anything else.
+  agent:
+    image: your-agent-image
+    networks:
+      - isolated
+    environment:
+      - API_BASE_URL=http://gateway:8080
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  # ─── The Gateway Sidecar ───
+  # Sits on both networks. The agent can reach it, and it can reach the outside.
+  gateway:
+    image: ghcr.io/realugbun/airlock:latest
+    networks:
+      - isolated
+      - external
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+      - vault-token:/run/secrets/vault-token:ro
+    healthcheck:
+      test: ["CMD", "/airlock", "-healthcheck"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+volumes:
+  vault-token:
+    external: true
+
+networks:
+  isolated:
+    internal: true   # no internet access
+  external:
+    driver: bridge

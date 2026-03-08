@@ -1,0 +1,31 @@
+listen: ":8080"
+service: "airlock-live-test"
+agent_id: "test-agent-01"
+
+providers:
+  env: {}
+
+routes:
+  - path_prefix: "/api"
+    upstream: "https://httpbin.org"
+    strip_prefix: "/api"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "TEST_API_TOKEN"
+      header: "Authorization"
+      prefix: "Bearer "
+    rate_limit:
+      rps: 5
+      burst: 10
+    access_rules:
+      - action: ALLOW
+        method: GET
+        path: /headers
+      - action: ALLOW
+        method: GET
+        path: /get
+      - action: ALLOW
+        method: GET
+        path: /status/**

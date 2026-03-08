@@ -1,0 +1,158 @@
+listen: ":8080"
+service: "github.com/realugbun/airlock"
+
+# Optional. Included in every log line and sent as X-Agent-Id upstream.
+agent_id: "research-agent-01"
+
+# Strict mode (default: true). Requires access_rules on every route.
+# Set to false to allow routes without access_rules (not recommended for production).
+# strict: true
+
+telemetry:
+  endpoint: "otel-collector.example.com:4317"
+  service_name: "airlock"
+  insecure: true
+
+# ─── Secret Providers ───
+providers:
+  vault:
+    address: "https://vault.example.com:8200"
+    token_path: "/run/secrets/vault-token"
+    skip_verify: true
+    cache_ttl: "5m"
+
+  # env: {}
+  # envfile:
+  #   path: "/run/secrets/credentials.env"
+  # file: {}
+  # aws_sm:
+  #   region: "us-east-1"
+
+# ─── Routes ───
+routes:
+  - path_prefix: "/openai"
+    upstream: "https://api.openai.com"
+    strip_prefix: "/openai"
+    auth:
+      type: static
+      token:
+        from: vault
+        path: "secret/openai"
+        key: "api-key"
+      header: "Authorization"
+      prefix: "Bearer "
+    timeout: "300s"        # Total request timeout (default 300s, 0 to disable)
+    idle_timeout: "60s"    # Kill if no bytes received for this long (default 60s, 0 to disable)
+    rate_limit:
+      rps: 10
+      burst: 20
+    # Firewall-style rules — first match wins, implicit deny at end.
+    access_rules:
+      - action: ALLOW
+        method: POST
+        path: /v1/chat/completions
+      - action: ALLOW
+        method: POST
+        path: /v1/embeddings
+
+    # Remove these upstream response headers entirely (optional).
+    strip_response_headers:
+      - Server
+      - X-Powered-By
+
+  # ── Claude Code agent proxy example ──
+  - path_prefix: "/anthropic"
+    upstream: "https://api.anthropic.com"
+    strip_prefix: "/anthropic"
+    timeout: "300s"
+    idle_timeout: "120s"
+    strip_agent_auth: true
+    extra_headers:
+      anthropic-beta: "oauth-2025-04-20"
+      anthropic-version: "2023-06-01"
+    auth:
+      type: static
+      token:
+        from: vault
+        path: "secret/anthropic"
+        key: "setup-token"
+      header: "Authorization"
+      prefix: "Bearer "
+    rate_limit:
+      rps: 5
+      burst: 10
+    access_rules:
+      - action: ALLOW
+        method: POST
+        path: /v1/messages
+      - action: ALLOW
+        method: POST
+        path: /v1/messages/count_tokens
+
+  - path_prefix: "/github"
+    upstream: "https://api.github.com"
+    strip_prefix: "/github"
+    auth:
+      type: oauth2
+      client_id:
+        from: vault
+        path: "secret/github-oauth"
+        key: "client-id"
+      client_secret:
+        from: vault
+        path: "secret/github-oauth"
+        key: "client-secret"
+      refresh_token:
+        from: vault
+        path: "secret/github-oauth"
+        key: "refresh-token"
+      token_url: "https://github.com/login/oauth/access_token"
+      header: "Authorization"
+      prefix: "Bearer "
+    rate_limit:
+      rps: 5
+      burst: 10
+    access_rules:
+      - action: DENY
+        method: ALL
+        path: /repos/*/settings
+      - action: DENY
+        method: DELETE
+        path: /repos/**
+      - action: ALLOW
+        method: GET
+        path: /repos/**
+      - action: ALLOW
+        method: GET
+        path: /user
+
+  # ── MCP Server proxy with tool filtering ──
+  - path_prefix: "/mcp-workspace"
+    upstream: "http://mcp-server:8000"
+    strip_prefix: "/mcp-workspace"
+    timeout: "0"
+    idle_timeout: "300s"
+    auth:
+      type: static
+      token:
+        from: vault
+        path: "secret/mcp-workspace"
+        key: "api-key"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - action: ALLOW
+        method: ALL
+        path: /**
+    # MCP tool filtering — inspect JSON-RPC body for tools/call requests.
+    # Three modes:
+    #   mcp_rules: {}                           — allow all tools
+    #   mcp_rules: { denied_tools: [...] }      — block specific tools
+    #   mcp_rules: { allowed_tools: [...] }     — strict allowlist
+    mcp_rules:
+      allowed_tools:
+        - get_events
+        - list_calendars
+        - list_contacts
+        - search_emails
+        - get_email

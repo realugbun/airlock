@@ -1,0 +1,54 @@
+# GitHub Git operations with a scoped Personal Access Token.
+#
+# This proxies Git smart HTTP protocol (clone, fetch, push) through
+# Airlock using a PAT scoped to repo read/write. The agent can use
+# standard git commands without ever seeing the token.
+#
+# The access rules allow only the three Git smart HTTP endpoints:
+#   - GET  /{owner}/{repo}/info/refs       — ref discovery (clone/fetch/push)
+#   - POST /{owner}/{repo}/git-upload-pack  — fetch/clone data
+#   - POST /{owner}/{repo}/git-receive-pack — push data
+#
+# Run:
+#   GITHUB_PAT=ghp_... airlock -config examples/github-git-pat.yaml
+#
+# Agent setup — redirect GitHub traffic through Airlock:
+#   git config --global url."http://localhost:8080/github-git/".insteadOf "https://github.com/"
+#
+# Then standard git commands work transparently:
+#   git clone https://github.com/myorg/myrepo.git   # routes through Airlock
+#   git push                                          # routes through Airlock
+
+listen: ":8080"
+service: "my-agent"
+
+providers:
+  env: {}
+
+routes:
+  - path_prefix: "/github-git"
+    upstream: "https://github.com"
+    strip_prefix: "/github-git"
+    strip_agent_auth: true
+    auth:
+      type: static
+      token:
+        from: env
+        key: "GITHUB_PAT"
+      header: "Authorization"
+      prefix: "Bearer "
+    timeout: "120s"
+    idle_timeout: "30s"
+    rate_limit:
+      rps: 10
+      burst: 20
+    access_rules:
+      - action: ALLOW
+        method: GET
+        path: "/*/*/info/refs"
+      - action: ALLOW
+        method: POST
+        path: "/*/*/git-upload-pack"
+      - action: ALLOW
+        method: POST
+        path: "/*/*/git-receive-pack"

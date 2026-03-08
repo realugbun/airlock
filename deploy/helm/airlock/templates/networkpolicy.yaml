@@ -1,0 +1,77 @@
+{{- if .Values.networkPolicy.enabled }}
+# Gateway: restricts ingress to port 8080 and egress to configured upstreams.
+# Apply a separate NetworkPolicy to your agent pods to restrict their egress
+# to only this gateway — see docs/deployment.md for an example.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: airlock-gateway
+      instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    # DNS — always allowed
+    - to: []
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- if .Values.vault.enabled }}
+    # Vault
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vault
+      ports:
+        - port: 8200
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.networkPolicy.allowExternalHTTPS }}
+    # External HTTPS (public APIs)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - port: 443
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.networkPolicy.telemetryNamespace }}
+    # Telemetry (OTEL collector)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.telemetryNamespace }}
+      ports:
+        - port: 4317
+          protocol: TCP
+    {{- end }}
+    {{- range .Values.networkPolicy.extraEgress }}
+    - to:
+        {{- if .namespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .namespace }}
+        {{- end }}
+        {{- if .cidr }}
+        - ipBlock:
+            cidr: {{ .cidr }}
+        {{- end }}
+      ports:
+        - port: {{ .port }}
+          protocol: {{ default "TCP" .protocol }}
+    {{- end }}
+{{- end }}
