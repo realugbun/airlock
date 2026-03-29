@@ -28,6 +28,19 @@ import (
 
 var proxyTracer = otel.Tracer("github.com/realugbun/airlock")
 
+// stripForwardingTransport wraps a RoundTripper and removes X-Forwarded-*
+// headers that httputil.ReverseProxy adds after the Director runs.
+type stripForwardingTransport struct {
+	base http.RoundTripper
+}
+
+func (t *stripForwardingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Del("X-Forwarded-For")
+	req.Header.Del("X-Forwarded-Host")
+	req.Header.Del("X-Forwarded-Proto")
+	return t.base.RoundTrip(req)
+}
+
 // Route defines a single proxy route.
 type Route struct {
 	PathPrefix           string
@@ -40,6 +53,7 @@ type Route struct {
 	Timeout              time.Duration
 	IdleTimeout          time.Duration
 	StripAgentAuth       bool
+	StripForwardHeaders  bool
 	ExtraHeaders         map[string]string
 	MCPRules             *MCPToolPolicy
 	proxy                *httputil.ReverseProxy
@@ -143,6 +157,11 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	stripFwd := route.StripForwardHeaders
+	var baseTransport http.RoundTripper = otelhttp.NewTransport(transport)
+	if stripFwd {
+		baseTransport = &stripForwardingTransport{base: baseTransport}
+	}
 	route.proxy = &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = upstream.Scheme
@@ -155,7 +174,7 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 				}
 			}
 		},
-		Transport: otelhttp.NewTransport(transport),
+		Transport: baseTransport,
 		ModifyResponse: func(resp *http.Response) error {
 			redactValues := redactValuesFromContext(resp.Request.Context())
 

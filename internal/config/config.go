@@ -89,6 +89,7 @@ type RouteConfig struct {
 	Timeout              string             `yaml:"timeout,omitempty"`
 	IdleTimeout          string             `yaml:"idle_timeout,omitempty"`
 	StripAgentAuth       bool               `yaml:"strip_agent_auth,omitempty"`
+	StripForwardHeaders  bool               `yaml:"strip_forwarding_headers,omitempty"`
 	ExtraHeaders         map[string]string  `yaml:"extra_headers,omitempty"`
 	MCPRules             *MCPRulesConfig    `yaml:"mcp_rules,omitempty"`
 }
