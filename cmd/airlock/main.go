@@ -227,6 +227,7 @@ func buildRoutes(cfg *config.Config, registry *secrets.Registry, logger *slog.Lo
 			Timeout:              timeout,
 			IdleTimeout:          idleTimeout,
 			StripAgentAuth:       routeCfg.StripAgentAuth,
+			StripForwardHeaders:  routeCfg.StripForwardHeaders,
 			ExtraHeaders:         routeCfg.ExtraHeaders,
 			MCPRules:             mcpRules,
 		})
