@@ -16,7 +16,7 @@ import (
 // OAuth2AuthConfig configures an OAuth2 refresh-token auth provider.
 type OAuth2AuthConfig struct {
 	ClientID     secrets.SecretRef
-	ClientSecret secrets.SecretRef
+	ClientSecret *secrets.SecretRef // nil for public clients (no client_secret)
 	RefreshToken secrets.SecretRef
 	TokenURL     string
 	Scopes       string
@@ -36,7 +36,7 @@ type tokenResponse struct {
 type OAuth2Auth struct {
 	registry     *secrets.Registry
 	clientIDRef  secrets.SecretRef
-	clientSecRef secrets.SecretRef
+	clientSecRef *secrets.SecretRef
 	refreshRef   secrets.SecretRef
 	tokenURL     string
 	scopes       string
@@ -105,11 +105,6 @@ func (o *OAuth2Auth) refresh(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("resolving client_id: %w", err)
 	}
 
-	clientSecret, err := o.clientSecRef.Resolve(ctx, o.registry)
-	if err != nil {
-		return "", fmt.Errorf("resolving client_secret: %w", err)
-	}
-
 	refreshToken, err := o.refreshRef.Resolve(ctx, o.registry)
 	if err != nil {
 		return "", fmt.Errorf("resolving refresh_token: %w", err)
@@ -119,7 +114,13 @@ func (o *OAuth2Auth) refresh(ctx context.Context) (string, error) {
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {refreshToken},
 		"client_id":     {clientID},
-		"client_secret": {clientSecret},
+	}
+	if o.clientSecRef != nil {
+		clientSecret, err := o.clientSecRef.Resolve(ctx, o.registry)
+		if err != nil {
+			return "", fmt.Errorf("resolving client_secret: %w", err)
+		}
+		data.Set("client_secret", clientSecret)
 	}
 	if o.scopes != "" {
 		data.Set("scope", o.scopes)

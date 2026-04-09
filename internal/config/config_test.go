@@ -482,6 +482,88 @@ routes:
 	assert.Contains(t, err.Error(), "access_rules required")
 }
 
+func TestLoadConfig_TLSFingerprint_ValidValues(t *testing.T) {
+	for _, fp := range []string{"chrome", "firefox", "random", "go"} {
+		t.Run(fp, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yaml")
+			content := `
+service: "test-svc"
+strict: false
+providers:
+  env: {}
+routes:
+  - path_prefix: "/api"
+    upstream: "https://api.example.com"
+    tls_fingerprint: ` + fp + `
+    auth:
+      type: static
+      token:
+        from: env
+        key: "KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+`
+			require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+			cfg, err := Load(path)
+			require.NoError(t, err)
+			assert.Equal(t, fp, cfg.Routes[0].TLSFingerprint)
+		})
+	}
+}
+
+func TestLoadConfig_TLSFingerprint_Invalid(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `
+service: "test-svc"
+strict: false
+providers:
+  env: {}
+routes:
+  - path_prefix: "/api"
+    upstream: "https://api.example.com"
+    tls_fingerprint: safari
+    auth:
+      type: static
+      token:
+        from: env
+        key: "KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown tls_fingerprint")
+	assert.Contains(t, err.Error(), "safari")
+}
+
+func TestLoadConfig_TLSFingerprint_Omitted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `
+service: "test-svc"
+strict: false
+providers:
+  env: {}
+routes:
+  - path_prefix: "/api"
+    upstream: "https://api.example.com"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "", cfg.Routes[0].TLSFingerprint)
+}
+
 func TestLoadConfig_StrictDefault_ExplicitEmptyRules_OK(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

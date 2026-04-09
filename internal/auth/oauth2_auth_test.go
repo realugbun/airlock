@@ -44,7 +44,7 @@ func TestOAuth2Auth_AddAuth(t *testing.T) {
 
 	oauthAuth := NewOAuth2Auth(registry, OAuth2AuthConfig{
 		ClientID:     secrets.SecretRef{From: "vault", Path: "secret/oauth", Key: "client-id"},
-		ClientSecret: secrets.SecretRef{From: "vault", Path: "secret/oauth", Key: "client-secret"},
+		ClientSecret: &secrets.SecretRef{From: "vault", Path: "secret/oauth", Key: "client-secret"},
 		RefreshToken: secrets.SecretRef{From: "vault", Path: "secret/oauth", Key: "refresh-token"},
 		TokenURL:     tokenServer.URL,
 		Header:       "Authorization",
@@ -83,7 +83,7 @@ func TestOAuth2Auth_CachesToken(t *testing.T) {
 
 	oauthAuth := NewOAuth2Auth(registry, OAuth2AuthConfig{
 		ClientID:     secrets.SecretRef{From: "vault", Path: "p", Key: "k"},
-		ClientSecret: secrets.SecretRef{From: "vault", Path: "p", Key: "k"},
+		ClientSecret: &secrets.SecretRef{From: "vault", Path: "p", Key: "k"},
 		RefreshToken: secrets.SecretRef{From: "vault", Path: "p", Key: "k"},
 		TokenURL:     tokenServer.URL,
 		Header:       "Authorization",
@@ -116,7 +116,7 @@ func TestOAuth2Auth_TokenEndpointError(t *testing.T) {
 
 	oauthAuth := NewOAuth2Auth(registry, OAuth2AuthConfig{
 		ClientID:     secrets.SecretRef{From: "vault", Path: "p", Key: "k"},
-		ClientSecret: secrets.SecretRef{From: "vault", Path: "p", Key: "k"},
+		ClientSecret: &secrets.SecretRef{From: "vault", Path: "p", Key: "k"},
 		RefreshToken: secrets.SecretRef{From: "vault", Path: "p", Key: "k"},
 		TokenURL:     tokenServer.URL,
 		Header:       "Authorization",
@@ -128,4 +128,50 @@ func TestOAuth2Auth_TokenEndpointError(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "401")
 	assert.Nil(t, redact)
+}
+
+func TestOAuth2Auth_PublicClient_NoClientSecret(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "application/x-www-form-urlencoded", r.Header.Get("Content-Type"))
+		require.NoError(t, r.ParseForm())
+		assert.Equal(t, "refresh_token", r.FormValue("grant_type"))
+		assert.Equal(t, "test-refresh", r.FormValue("refresh_token"))
+		assert.Equal(t, "test-client-id", r.FormValue("client_id"))
+		// client_secret must NOT be present for public clients
+		assert.Empty(t, r.FormValue("client_secret"), "client_secret should not be sent for public clients")
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"access_token": "public-access-token",
+			"token_type":   "bearer",
+			"expires_in":   3600,
+		})
+	}))
+	defer tokenServer.Close()
+
+	mockProvider := new(MockSecretProvider)
+	mockProvider.On("GetSecret", mock.Anything, "secret/oauth", "client-id").
+		Return("test-client-id", nil)
+	mockProvider.On("GetSecret", mock.Anything, "secret/oauth", "refresh-token").
+		Return("test-refresh", nil)
+
+	registry := secrets.NewRegistry()
+	registry.Register("vault", mockProvider)
+
+	oauthAuth := NewOAuth2Auth(registry, OAuth2AuthConfig{
+		ClientID:     secrets.SecretRef{From: "vault", Path: "secret/oauth", Key: "client-id"},
+		ClientSecret: nil, // public client — no client_secret
+		RefreshToken: secrets.SecretRef{From: "vault", Path: "secret/oauth", Key: "refresh-token"},
+		TokenURL:     tokenServer.URL,
+		Header:       "Authorization",
+		Prefix:       "Bearer ",
+	})
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	redact, err := oauthAuth.AddAuth(context.Background(), req)
+
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer public-access-token", req.Header.Get("Authorization"))
+	assert.Contains(t, redact, "public-access-token")
+	mockProvider.AssertExpectations(t)
 }

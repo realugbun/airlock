@@ -91,6 +91,7 @@ type RouteConfig struct {
 	StripAgentAuth       bool               `yaml:"strip_agent_auth,omitempty"`
 	StripForwardHeaders  bool               `yaml:"strip_forwarding_headers,omitempty"`
 	ExtraHeaders         map[string]string  `yaml:"extra_headers,omitempty"`
+	TLSFingerprint       string             `yaml:"tls_fingerprint,omitempty"`
 	MCPRules             *MCPRulesConfig    `yaml:"mcp_rules,omitempty"`
 }
 
@@ -174,8 +175,8 @@ func (c *Config) validate() error {
 				return fmt.Errorf("route %d: auth.token is required for static auth", i)
 			}
 		case "oauth2":
-			if r.Auth.ClientID == nil || r.Auth.ClientSecret == nil || r.Auth.RefreshToken == nil {
-				return fmt.Errorf("route %d: client_id, client_secret, and refresh_token are required for oauth2 auth", i)
+			if r.Auth.ClientID == nil || r.Auth.RefreshToken == nil {
+				return fmt.Errorf("route %d: client_id and refresh_token are required for oauth2 auth", i)
 			}
 			if r.Auth.TokenURL == "" {
 				return fmt.Errorf("route %d: auth.token_url is required for oauth2 auth", i)
@@ -185,6 +186,12 @@ func (c *Config) validate() error {
 		}
 		if r.Auth.Header == "" {
 			return fmt.Errorf("route %d: auth.header is required", i)
+		}
+		switch r.TLSFingerprint {
+		case "", "go", "chrome", "firefox", "random":
+			// valid
+		default:
+			return fmt.Errorf("route %d: unknown tls_fingerprint %q (valid: chrome, firefox, random, go)", i, r.TLSFingerprint)
 		}
 		if r.MCPRules != nil && len(r.MCPRules.AllowedTools) > 0 && len(r.MCPRules.DeniedTools) > 0 {
 			return fmt.Errorf("route %d: mcp_rules cannot have both allowed_tools and denied_tools", i)

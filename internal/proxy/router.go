@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -18,6 +19,7 @@ import (
 	"github.com/realugbun/airlock/internal/auth"
 	"github.com/realugbun/airlock/internal/middleware"
 	airlocklog "github.com/realugbun/airlock/pkg/log"
+	utls "github.com/refraction-networking/utls"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -55,8 +57,12 @@ type Route struct {
 	StripAgentAuth       bool
 	StripForwardHeaders  bool
 	ExtraHeaders         map[string]string
+	TLSFingerprint       string
 	MCPRules             *MCPToolPolicy
 	proxy                *httputil.ReverseProxy
+	directClient         *http.Client       // used instead of proxy when useDirectProxy is true
+	directTransport      http.RoundTripper  // the otelhttp-wrapped transport for directClient
+	useDirectProxy       bool               // true when TLS fingerprint requires bypassing httputil.ReverseProxy
 }
 
 // RouterConfig holds router settings.
@@ -139,6 +145,24 @@ func redactValuesFromContext(ctx context.Context) []string {
 	return nil
 }
 
+// utlsClientHelloID maps a tls_fingerprint config value to a uTLS ClientHelloID.
+// Returns nil for empty/"go" (use default Go TLS).
+func utlsClientHelloID(name string) *utls.ClientHelloID {
+	switch name {
+	case "chrome":
+		id := utls.HelloChrome_Auto
+		return &id
+	case "firefox":
+		id := utls.HelloFirefox_Auto
+		return &id
+	case "random":
+		id := utls.HelloRandomized
+		return &id
+	default:
+		return nil
+	}
+}
+
 func initRouteProxy(route *Route, logger *slog.Logger) {
 	upstream := route.Upstream
 	stripPrefix := route.StripPrefix
@@ -146,10 +170,12 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 	idleTimeout := route.IdleTimeout
 	routePrefix := route.PathPrefix
 
-	// Use a custom transport instead of http.DefaultTransport to avoid
-	// ForceAttemptHTTP2 which breaks plain HTTP upstreams (returns 502).
+	// Enable HTTP/2 for HTTPS upstreams (needed for Cloudflare-protected
+	// sites that fingerprint the TLS ClientHello). Plain HTTP upstreams
+	// must stay on HTTP/1.1 — ForceAttemptHTTP2 returns 502 for them.
+	useHTTP2 := upstream.Scheme == "https"
 	transport := &http.Transport{
-		ForceAttemptHTTP2:     false,
+		ForceAttemptHTTP2:     useHTTP2,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
@@ -157,11 +183,82 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	// When a TLS fingerprint is configured, use uTLS to present a
+	// browser-like ClientHello instead of Go's default fingerprint.
+	// This bypasses Cloudflare-style bot detection on upstreams.
+	//
+	// We use HelloCustom with the browser's spec but strip h2 from
+	// ALPN, forcing HTTP/1.1. This avoids Go's HTTP/2 SETTINGS frame
+	// fingerprint (which Cloudflare also detects) while keeping the
+	// browser TLS ClientHello fingerprint intact.
+	if helloID := utlsClientHelloID(route.TLSFingerprint); helloID != nil && upstream.Scheme == "https" {
+		fingerprint := *helloID
+		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: 10 * time.Second}
+			tcpConn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr
+			}
+			// Get the browser spec and replace h2 with http/1.1 in ALPN.
+			spec, specErr := utls.UTLSIdToSpec(fingerprint)
+			if specErr != nil {
+				_ = tcpConn.Close()
+				return nil, fmt.Errorf("utls spec: %w", specErr)
+			}
+			for i, ext := range spec.Extensions {
+				if alpn, ok := ext.(*utls.ALPNExtension); ok {
+					alpn.AlpnProtocols = []string{"http/1.1"}
+					spec.Extensions[i] = alpn
+				}
+			}
+			utlsConn := utls.UClient(tcpConn, &utls.Config{
+				ServerName:         host,
+				InsecureSkipVerify: false,
+			}, utls.HelloCustom)
+			if err := utlsConn.ApplyPreset(&spec); err != nil {
+				_ = tcpConn.Close()
+				return nil, fmt.Errorf("utls apply preset: %w", err)
+			}
+			if err := utlsConn.HandshakeContext(ctx); err != nil {
+				_ = tcpConn.Close()
+				return nil, err
+			}
+			return utlsConn, nil
+		}
+		transport.TLSHandshakeTimeout = 0
+		transport.ForceAttemptHTTP2 = false
+	}
+
 	stripFwd := route.StripForwardHeaders
 	var baseTransport http.RoundTripper = otelhttp.NewTransport(transport)
 	if stripFwd {
 		baseTransport = &stripForwardingTransport{base: baseTransport}
 	}
+
+	// For routes with a TLS fingerprint on HTTPS upstreams, use a direct
+	// http.Client instead of httputil.ReverseProxy. ReverseProxy modifies
+	// HTTP/2 framing (SETTINGS, HEADERS) in ways that Cloudflare's bot
+	// detection catches. A plain http.Client.Do() with the same
+	// http2.Transport + uTLS preserves the browser-like fingerprint.
+	if utlsClientHelloID(route.TLSFingerprint) != nil && upstream.Scheme == "https" {
+		route.useDirectProxy = true
+		// Use the raw transport without otelhttp wrapper for fingerprinted
+		// routes. The otelhttp wrapper adds traceparent/tracestate headers
+		// that can contribute to bot detection fingerprinting.
+		route.directTransport = transport
+		route.directClient = &http.Client{
+			Transport: transport,
+			// Don't follow redirects — proxy should return them as-is.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+	}
+
 	route.proxy = &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = upstream.Scheme
@@ -172,6 +269,11 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 				if req.URL.Path == "" {
 					req.URL.Path = "/"
 				}
+			}
+			// Join the upstream base path with the request path.
+			// e.g. upstream=/backend-api/codex + request=/responses = /backend-api/codex/responses
+			if upstream.Path != "" && upstream.Path != "/" {
+				req.URL.Path = strings.TrimRight(upstream.Path, "/") + req.URL.Path
 			}
 		},
 		Transport: baseTransport,
@@ -278,6 +380,186 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 			}
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		},
+	}
+}
+
+// hopByHopHeaders are HTTP/1.1 hop-by-hop headers that must not be forwarded.
+var hopByHopHeaders = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+}
+
+// serveDirectProxy handles a request by making a direct http.Client.Do() call
+// to the upstream, bypassing httputil.ReverseProxy. This preserves the HTTP/2
+// framing generated by http2.Transport + uTLS, which is critical for passing
+// Cloudflare's TLS/HTTP2 fingerprinting checks.
+func (rt *Router) serveDirectProxy(route *Route, w http.ResponseWriter, r *http.Request) {
+	upstream := route.Upstream
+
+	// Build the upstream URL.
+	targetPath := r.URL.Path
+	if route.StripPrefix != "" {
+		targetPath = strings.TrimPrefix(targetPath, route.StripPrefix)
+		if targetPath == "" {
+			targetPath = "/"
+		}
+	}
+	upstreamURL := *upstream
+	// Join the upstream base path with the target path.
+	// e.g. upstream=/backend-api/codex + target=/responses = /backend-api/codex/responses
+	if upstream.Path != "" && upstream.Path != "/" {
+		upstreamURL.Path = strings.TrimRight(upstream.Path, "/") + targetPath
+	} else {
+		upstreamURL.Path = targetPath
+	}
+	upstreamURL.RawQuery = r.URL.RawQuery
+
+	// Create the outbound request with the same context (carries timeout, cancel, etc.).
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), r.Body)
+	if err != nil {
+		rt.logger.Error("failed to create upstream request",
+			"error", err.Error(),
+			"route", route.PathPrefix,
+		)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// Copy headers, skipping hop-by-hop headers.
+	for key, values := range r.Header {
+		if hopByHopHeaders[http.CanonicalHeaderKey(key)] {
+			continue
+		}
+		for _, v := range values {
+			outReq.Header.Add(key, v)
+		}
+	}
+	outReq.Host = upstream.Host
+
+	// Make the request.
+	resp, err := route.directClient.Do(outReq)
+	if err != nil {
+		if r.Context().Err() != nil {
+			http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+			return
+		}
+		rt.logger.Error("upstream request failed",
+			"error", err.Error(),
+			"route", route.PathPrefix,
+		)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Apply the same response modifications as ModifyResponse in the ReverseProxy path.
+	redactValues := redactValuesFromContext(r.Context())
+
+	// Wrap body with idle timeout reader if configured.
+	body := resp.Body
+	if route.IdleTimeout > 0 {
+		if cancelFn := idleCancelFromContext(r.Context()); cancelFn != nil {
+			body = newIdleTimeoutReader(body, route.IdleTimeout, cancelFn)
+		}
+	}
+
+	// MCP tools/list filtering.
+	mcpFiltered := false
+	if mcpInfo := mcpInfoFromContext(r.Context()); mcpInfo != nil && mcpInfo.Method == "tools/list" {
+		ct := resp.Header.Get("Content-Type")
+		if strings.HasPrefix(ct, "text/event-stream") {
+			body = newMCPToolFilterReader(body, mcpInfo.Policy, rt.logger, route.PathPrefix)
+			resp.Header.Del("Content-Length")
+		} else {
+			rawBody, readErr := io.ReadAll(body)
+			body.Close()
+			if readErr != nil {
+				body = io.NopCloser(bytes.NewReader(nil))
+			} else {
+				fr, filterErr := mcpInfo.Policy.FilterToolsListResponse(rawBody, ct)
+				if filterErr == nil && fr.AllTools != nil {
+					rt.logger.Info("MCP tools discovered",
+						"route", route.PathPrefix,
+						"upstream_tools", fr.AllTools,
+						"allowed_tools", fr.AllowedTools,
+						"upstream_count", len(fr.AllTools),
+						"allowed_count", len(fr.AllowedTools),
+					)
+					body = io.NopCloser(bytes.NewReader(fr.Body))
+					resp.Header.Set("Content-Length", strconv.Itoa(len(fr.Body)))
+				} else {
+					body = io.NopCloser(bytes.NewReader(rawBody))
+				}
+			}
+		}
+		mcpFiltered = true
+	}
+
+	// SSE transport fallback for MCP-filtered routes.
+	if !mcpFiltered && route.MCPRules != nil && route.MCPRules.hasToolRules() &&
+		strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		body = newMCPToolFilterReader(body, route.MCPRules, rt.logger, route.PathPrefix)
+		resp.Header.Del("Content-Length")
+	}
+
+	// Redact credential values from response headers.
+	if len(redactValues) > 0 {
+		redactHeaderValues(resp.Header, redactValues)
+	}
+
+	// Strip configured response headers.
+	for _, h := range route.StripResponseHeaders {
+		resp.Header.Del(h)
+	}
+
+	// Wrap response body with a redacting reader.
+	if len(redactValues) > 0 {
+		isSSE := false
+		if ct := resp.Header.Get("Content-Type"); ct != "" {
+			if baseCT, _, _ := mime.ParseMediaType(ct); baseCT == "text/event-stream" {
+				isSSE = true
+			}
+		}
+		if isSSE {
+			body = newSSERedactingReader(body, redactValues)
+		} else {
+			body = newRedactingReader(body, redactValues)
+		}
+		resp.Header.Del("Content-Length")
+	}
+
+	// Copy response headers to the client.
+	for key, values := range resp.Header {
+		for _, v := range values {
+			w.Header().Add(key, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream the response body, flushing for SSE.
+	if f, ok := w.(http.Flusher); ok {
+		buf := make([]byte, 32*1024)
+		for {
+			n, readErr := body.Read(buf)
+			if n > 0 {
+				_, writeErr := w.Write(buf[:n])
+				if writeErr != nil {
+					return
+				}
+				f.Flush()
+			}
+			if readErr != nil {
+				return
+			}
+		}
+	} else {
+		_, _ = io.Copy(w, body)
 	}
 }
 
@@ -506,5 +788,10 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 			attribute.String("status", "proxied"),
 		))
 
-	route.proxy.ServeHTTP(w, r)
+	if route.useDirectProxy {
+		rt.logger.Info("using direct proxy path", "route", route.PathPrefix, "tls_fingerprint", route.TLSFingerprint)
+		rt.serveDirectProxy(route, w, r)
+	} else {
+		route.proxy.ServeHTTP(w, r)
+	}
 }

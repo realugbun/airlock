@@ -229,6 +229,7 @@ func buildRoutes(cfg *config.Config, registry *secrets.Registry, logger *slog.Lo
 			StripAgentAuth:       routeCfg.StripAgentAuth,
 			StripForwardHeaders:  routeCfg.StripForwardHeaders,
 			ExtraHeaders:         routeCfg.ExtraHeaders,
+			TLSFingerprint:       routeCfg.TLSFingerprint,
 			MCPRules:             mcpRules,
 		})
 	}
@@ -296,7 +297,7 @@ func buildAuthProvider(registry *secrets.Registry, routeCfg config.RouteConfig) 
 	case "oauth2":
 		return auth.NewOAuth2Auth(registry, auth.OAuth2AuthConfig{
 			ClientID:     *routeCfg.Auth.ClientID,
-			ClientSecret: *routeCfg.Auth.ClientSecret,
+			ClientSecret: routeCfg.Auth.ClientSecret,
 			RefreshToken: *routeCfg.Auth.RefreshToken,
 			TokenURL:     routeCfg.Auth.TokenURL,
 			Scopes:       routeCfg.Auth.Scopes,
