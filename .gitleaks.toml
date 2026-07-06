@@ -1,4 +1,9 @@
+[extend]
+useDefault = true
+
 [allowlist]
   paths = [
+  # benign machine-generated catalogs (2026-07-06 secret-hardening)
+  "\\.secrets\\.baseline$",
     '''_test\.go$''',
   ]
