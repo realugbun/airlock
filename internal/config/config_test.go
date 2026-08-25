@@ -509,3 +509,123 @@ routes:
 	assert.NotNil(t, cfg.Routes[0].AccessRules)
 	assert.Len(t, cfg.Routes[0].AccessRules, 0)
 }
+
+// =============================================================================
+// path_regex validation
+// =============================================================================
+
+func TestLoadConfig_PathRegex_Valid(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `
+service: "test-svc"
+providers:
+  env: {}
+routes:
+  - path_prefix: "/jira"
+    upstream: "https://api.atlassian.com"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - { action: ALLOW, method: PUT, path_regex: '/rest/api/3/issue/AI-\d+' }
+      - { action: DENY,  method: ALL, path: /** }
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, `/rest/api/3/issue/AI-\d+`, cfg.Routes[0].AccessRules[0].PathRegex)
+	assert.Equal(t, "", cfg.Routes[0].AccessRules[0].Path)
+}
+
+func TestLoadConfig_PathRegex_BothPathAndRegex_Error(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `
+service: "test-svc"
+providers:
+  env: {}
+routes:
+  - path_prefix: "/jira"
+    upstream: "https://api.atlassian.com"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - { action: ALLOW, method: GET, path: /foo, path_regex: '/foo' }
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only one of path or path_regex")
+	assert.Contains(t, err.Error(), "/jira")
+	assert.Contains(t, err.Error(), "access_rules[0]")
+}
+
+func TestLoadConfig_PathRegex_NeitherSet_Error(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `
+service: "test-svc"
+providers:
+  env: {}
+routes:
+  - path_prefix: "/jira"
+    upstream: "https://api.atlassian.com"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - { action: ALLOW, method: GET }
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "one of path or path_regex is required")
+}
+
+func TestLoadConfig_PathRegex_TooLong_Error(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	long := make([]byte, MaxPathRegexLen+1)
+	for i := range long {
+		long[i] = 'a'
+	}
+	content := `
+service: "test-svc"
+providers:
+  env: {}
+routes:
+  - path_prefix: "/jira"
+    upstream: "https://api.atlassian.com"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - { action: ALLOW, method: GET, path_regex: '` + string(long) + `' }
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds")
+}
