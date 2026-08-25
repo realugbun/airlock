@@ -475,6 +475,16 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 	// Store redact values in context for ModifyResponse to use.
 	if len(redactValues) > 0 {
 		ctx = withRedactValues(ctx, redactValues)
+		// Response redaction operates on the decoded body. If the upstream
+		// compresses the response (Content-Encoding: gzip/br/zstd), the
+		// redacting readers would (a) scan compressed bytes and silently miss
+		// the secrets, and (b) corrupt the framing — the SSE reader flushes on
+		// \n\n boundaries that occur randomly in a binary stream — which reaches
+		// the agent as a "ZlibError"/invalid-compressed-data decode failure.
+		// Drop the agent's Accept-Encoding so the upstream returns a body the
+		// Go transport hands back decoded; redaction then sees plaintext and the
+		// agent receives an identity-encoded response.
+		r.Header.Del("Accept-Encoding")
 	}
 
 	// Apply request timeouts.
