@@ -58,6 +58,61 @@ Airlock matches against `r.URL.Path` (the percent-decoded request path) after `s
 
 The fuzz seed corpus includes all of the above attack vectors plus extreme-length paths (1000+ segments).
 
+## Regex Path Matching (`path_regex`)
+
+Each access rule must specify exactly one of `path` (glob) or `path_regex` (RE2 regex). Both cannot be set on the same rule — startup fails with a clear validation error if they are.
+
+**When to use which:**
+
+- **Default to `path`.** Glob is segment-based, easier to read, and protected by the bounded DP matcher described above. Use it for the common case (whole-segment matches, prefixes, simple wildcards).
+- **Use `path_regex` only when you need within-segment constraints** that glob cannot express — for example, restricting writes to issue keys matching `REC-\d+` while leaving reads unrestricted.
+
+**Example: restrict writes to a single record prefix**
+
+```yaml
+access_rules:
+  - { action: ALLOW, method: GET,  path: /v1/search/jql }
+  - { action: ALLOW, method: PUT,  path_regex: '/v1/records/REC-\d+' }
+  - { action: ALLOW, method: GET,  path_regex: '/v1/records/REC-\d+' }
+  - { action: ALLOW, method: POST, path_regex: '/v1/records/REC-\d+/comment' }
+  - { action: DENY,  method: ALL,  path: /** }
+```
+
+### Semantics
+
+- **Implicit full-match anchoring.** Every `path_regex` is wrapped as `\A(?:<your_pattern>)\z` before compilation. Your pattern must match the entire path, not a prefix or substring. Adding your own `^` or `$` is harmless but redundant. The wrapping is non-capturing, which means alternations like `path_regex: 'foo|bar'` behave as `(?:foo|bar)` against the full path — neither branch matches `/prefix/foo` or `/foo/extra`.
+- **Same normalized path as glob.** The regex runs against the same normalized path glob sees: leading `/`, no trailing `/` (root stays `/`), interior `//` collapsed. A request to `/v1//records/REC-1` matches `path_regex: '/v1/records/REC-\d+'` for the same reason it would match the equivalent glob.
+- **First-match ordering is preserved.** Regex and glob rules can be mixed freely in the same `access_rules` list. Rules are still evaluated top-to-bottom, first match wins, with implicit deny at the end if rules are defined.
+- **Method semantics are unchanged.** `method: ALL` matches any verb; specific methods only match that verb. Regex applies to the path only — there is no method regex.
+
+### RE2 dialect (no lookahead, no backreferences)
+
+`path_regex` uses Go's standard library `regexp` package, which implements [RE2 syntax](https://pkg.go.dev/regexp/syntax). RE2 guarantees linear-time matching — there is no catastrophic backtracking, regardless of how the pattern is constructed. This is by design: features that require backtracking are not supported.
+
+Notably **not supported**:
+
+- Lookahead / lookbehind (`(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`)
+- Backreferences (`\1`, `\2`, etc.)
+- Atomic groups, possessive quantifiers
+
+If your matching need requires any of these, restructure as multiple rules or do the check upstream of Airlock.
+
+### Compiled once at config load
+
+Every `path_regex` is compiled when the gateway boots (or when config is reloaded). Invalid patterns fail loudly with the route prefix and rule index. Compilation is not done per request — there is no per-request regex compilation cost.
+
+### Length cap
+
+`path_regex` is capped at **512 characters** at config load. RE2 already prevents runtime DoS, but a multi-kilobyte regex in a YAML file is almost certainly a config mistake or an abuse of the loader. The cap is not configurable.
+
+### Performance
+
+RE2 matching is linear in the path length. A typical short URL path matches in under a microsecond — well within the noise floor of any real proxy hop. For the vast majority of deployments, regex matching cost is not measurable. The reason to prefer glob is readability and the segment-based safety guarantees, not throughput.
+
+### Capture groups and rewrites
+
+Regex is for **matching only**. Capture groups are ignored — they do not feed into URL rewriting, header injection, or any other downstream behavior. Path rewriting belongs in `strip_prefix` and `upstream` joining, not in `path_regex`.
+
 ## Fuzz Testing
 
 The access rule engine is covered by Go fuzz tests that throw millions of random inputs at the path matcher and access policy evaluator, looking for bypasses, panics, or unexpected matches:

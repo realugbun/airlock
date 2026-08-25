@@ -509,3 +509,216 @@ routes:
 	assert.NotNil(t, cfg.Routes[0].AccessRules)
 	assert.Len(t, cfg.Routes[0].AccessRules, 0)
 }
+
+// =============================================================================
+// path_regex validation
+// =============================================================================
+
+func TestLoadConfig_PathRegex_Valid(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `
+service: "test-svc"
+providers:
+  env: {}
+routes:
+  - path_prefix: "/upstream"
+    upstream: "https://api.example.com"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - { action: ALLOW, method: PUT, path_regex: '/v1/records/REC-\d+' }
+      - { action: DENY,  method: ALL, path: /** }
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, `/v1/records/REC-\d+`, cfg.Routes[0].AccessRules[0].PathRegex)
+	assert.Equal(t, "", cfg.Routes[0].AccessRules[0].Path)
+}
+
+func TestLoadConfig_PathRegex_BothPathAndRegex_Error(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `
+service: "test-svc"
+providers:
+  env: {}
+routes:
+  - path_prefix: "/upstream"
+    upstream: "https://api.example.com"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - { action: ALLOW, method: GET, path: /foo, path_regex: '/foo' }
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only one of path or path_regex")
+	assert.Contains(t, err.Error(), "/upstream")
+	assert.Contains(t, err.Error(), "access_rules[0]")
+}
+
+func TestLoadConfig_PathRegex_NeitherSet_Error(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `
+service: "test-svc"
+providers:
+  env: {}
+routes:
+  - path_prefix: "/upstream"
+    upstream: "https://api.example.com"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - { action: ALLOW, method: GET }
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "one of path or path_regex is required")
+}
+
+func TestLoadConfig_PathRegex_TooLong_Error(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	long := make([]byte, MaxPathRegexLen+1)
+	for i := range long {
+		long[i] = 'a'
+	}
+	content := `
+service: "test-svc"
+providers:
+  env: {}
+routes:
+  - path_prefix: "/upstream"
+    upstream: "https://api.example.com"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "KEY"
+      header: "Authorization"
+      prefix: "Bearer "
+    access_rules:
+      - { action: ALLOW, method: GET, path_regex: '` + string(long) + `' }
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds")
+}
+
+// --- auth.type: none -------------------------------------------------------
+
+// noneAuthConfig builds a single-route config whose auth block is `authBlock`.
+func noneAuthConfig(authBlock string) string {
+	return `
+service: "test-svc"
+providers:
+  env: {}
+routes:
+  - path_prefix: "/media"
+    upstream: "https://cdn.example.com"
+    strip_prefix: "/media"
+    strip_agent_auth: true
+` + authBlock + `
+    access_rules:
+      - action: ALLOW
+        method: GET
+        path: /file/*/binary
+      - action: DENY
+        method: ALL
+        path: /**
+`
+}
+
+func loadNoneAuthConfig(t *testing.T, authBlock string) (*Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(noneAuthConfig(authBlock)), 0600))
+	return Load(path)
+}
+
+func TestLoadConfig_AuthNone_Valid(t *testing.T) {
+	cfg, err := loadNoneAuthConfig(t, "    auth:\n      type: none")
+	require.NoError(t, err)
+	require.Len(t, cfg.Routes, 1)
+	assert.Equal(t, "none", cfg.Routes[0].Auth.Type)
+	// No credential fields are populated for a passthrough route.
+	assert.Nil(t, cfg.Routes[0].Auth.Token)
+	assert.Empty(t, cfg.Routes[0].Auth.Header)
+	// strip_agent_auth is orthogonal to auth type and must still be honoured.
+	assert.True(t, cfg.Routes[0].StripAgentAuth)
+}
+
+// A "none" route that also names a credential is almost certainly a mistake:
+// the author believes something is being injected when nothing is. Fail loudly
+// at load rather than silently proxying unauthenticated.
+func TestLoadConfig_AuthNone_RejectsCredentialFields(t *testing.T) {
+	cases := map[string]string{
+		"token":         "    auth:\n      type: none\n      token:\n        from: env\n        key: \"SOME_TOKEN\"",
+		"header":        "    auth:\n      type: none\n      header: \"Authorization\"",
+		"prefix":        "    auth:\n      type: none\n      prefix: \"Bearer \"",
+		"token_url":     "    auth:\n      type: none\n      token_url: \"https://example.com/token\"",
+		"scopes":        "    auth:\n      type: none\n      scopes: \"read\"",
+		"client_id":     "    auth:\n      type: none\n      client_id:\n        from: env\n        key: \"CID\"",
+		"client_secret": "    auth:\n      type: none\n      client_secret:\n        from: env\n        key: \"CSEC\"",
+		"refresh_token": "    auth:\n      type: none\n      refresh_token:\n        from: env\n        key: \"RTOK\"",
+	}
+	for name, authBlock := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := loadNoneAuthConfig(t, authBlock)
+			require.Error(t, err, "auth.type none with %s must be rejected", name)
+			assert.Contains(t, err.Error(), "injects no credential")
+		})
+	}
+}
+
+// Regression: relaxing the header requirement for "none" must not relax it for
+// the credential-injecting types.
+func TestLoadConfig_AuthHeaderStillRequiredForStatic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+service: "test-svc"
+providers:
+  env: {}
+routes:
+  - path_prefix: "/x"
+    upstream: "https://example.com"
+    auth:
+      type: static
+      token:
+        from: env
+        key: "TOKEN"
+    access_rules:
+      - action: ALLOW
+        method: GET
+        path: /**
+`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "auth.header is required")
+}

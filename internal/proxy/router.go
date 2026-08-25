@@ -178,6 +178,20 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 		ModifyResponse: func(resp *http.Response) error {
 			redactValues := redactValuesFromContext(resp.Request.Context())
 
+			// Fail closed if the body reached us still encoded. Redaction is
+			// exact-string matching over plaintext: scanning compressed bytes
+			// finds nothing, so the credential would pass through to the agent
+			// silently. The Go transport strips Content-Encoding when it
+			// transparently gunzips, so a non-identity value here means the body
+			// was NOT decoded — e.g. the upstream answered br/zstd despite
+			// negotiation, or a Range/HEAD request suppressed the transport's
+			// automatic gzip handling.
+			if len(redactValues) > 0 {
+				if enc := strings.TrimSpace(resp.Header.Get("Content-Encoding")); enc != "" && !strings.EqualFold(enc, "identity") {
+					return fmt.Errorf("refusing to forward %q-encoded response while credential redaction is active", enc)
+				}
+			}
+
 			// Wrap body with idle timeout reader if configured.
 			// Layered under the redacting reader so idle monitoring
 			// tracks raw upstream bytes, not buffered/redacted output.
@@ -475,6 +489,22 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 	// Store redact values in context for ModifyResponse to use.
 	if len(redactValues) > 0 {
 		ctx = withRedactValues(ctx, redactValues)
+		// Response redaction operates on the decoded body. If the upstream
+		// compresses the response (Content-Encoding: gzip/br/zstd), the
+		// redacting readers would (a) scan compressed bytes and silently miss
+		// the secrets, and (b) corrupt the framing — the SSE reader flushes on
+		// \n\n boundaries that occur randomly in a binary stream — which reaches
+		// the agent as a "ZlibError"/invalid-compressed-data decode failure.
+		// Drop the agent's Accept-Encoding so the upstream returns a body the
+		// Go transport hands back decoded; redaction then sees plaintext and the
+		// agent receives an identity-encoded response.
+		r.Header.Del("Accept-Encoding")
+		// Range/If-Range defeat redaction two ways: they suppress the Go
+		// transport's automatic gzip negotiation (so the body arrives encoded),
+		// and byte-range slicing lets an agent reassemble a credential from
+		// fragments that individually contain no complete match.
+		r.Header.Del("Range")
+		r.Header.Del("If-Range")
 	}
 
 	// Apply request timeouts.

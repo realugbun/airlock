@@ -2,8 +2,13 @@ package proxy
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
+
+// MaxPathRegexLen mirrors the cap enforced at config load. Duplicated here so the
+// proxy package rejects oversized regexes even when called outside the config loader.
+const MaxPathRegexLen = 512
 
 type action int
 
@@ -12,11 +17,13 @@ const (
 	actionDeny
 )
 
-// accessRule is a single firewall-style rule: action + method + path pattern.
+// accessRule is a single firewall-style rule: action + method + path matcher.
+// Exactly one of pattern (glob) or regex (RE2) is populated.
 type accessRule struct {
 	action  action
 	method  string // "ALL" matches any method
 	pattern string
+	regex   *regexp.Regexp
 }
 
 // AccessPolicy evaluates firewall-style rules in order. First match wins.
@@ -29,10 +36,12 @@ type AccessPolicy struct {
 }
 
 // AccessRuleInput is the structured input for a single rule.
+// Exactly one of Path (glob) or PathRegex (RE2) must be set.
 type AccessRuleInput struct {
-	Action string
-	Method string
-	Path   string
+	Action    string
+	Method    string
+	Path      string
+	PathRegex string
 }
 
 // NewAccessPolicy creates an access policy from ordered structured rules.
@@ -65,11 +74,26 @@ func (p *AccessPolicy) Allowed(method, path string) bool {
 	if len(p.rules) == 0 {
 		return true
 	}
+	// Enforce the segment cap once, for the whole request. matchSegments caps
+	// only the rules it evaluates, so without this an overlong path fails every
+	// glob rule (including a trailing DENY /**) and can then be caught by a
+	// later ALLOW path_regex, which has no such cap — a fail-open bypass that
+	// only appears once both matchers coexist.
+	if len(splitPath(path)) > maxPathSegments {
+		return false
+	}
+	normalized := normalizePath(path)
 	for _, r := range p.rules {
 		if r.method != "ALL" && r.method != method {
 			continue
 		}
-		if matchPattern(r.pattern, path) {
+		var hit bool
+		if r.regex != nil {
+			hit = r.regex.MatchString(normalized)
+		} else {
+			hit = matchPattern(r.pattern, path)
+		}
+		if hit {
 			return r.action == actionAllow
 		}
 	}
@@ -97,11 +121,50 @@ func parseRuleInput(input AccessRuleInput) (accessRule, error) {
 		return accessRule{}, fmt.Errorf("invalid method %q — use GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, or ALL", input.Method)
 	}
 
-	if input.Path == "" {
-		return accessRule{}, fmt.Errorf("path is required")
+	hasPath := input.Path != ""
+	hasRegex := input.PathRegex != ""
+	if hasPath && hasRegex {
+		return accessRule{}, fmt.Errorf("only one of path or path_regex may be set")
+	}
+	if !hasPath && !hasRegex {
+		return accessRule{}, fmt.Errorf("one of path or path_regex is required")
+	}
+
+	if hasRegex {
+		if len(input.PathRegex) > MaxPathRegexLen {
+			return accessRule{}, fmt.Errorf("path_regex exceeds %d characters", MaxPathRegexLen)
+		}
+		// Reject patterns that are not valid regexes on their own BEFORE
+		// wrapping. An unbalanced ")" would otherwise re-parenthesise the
+		// wrapper and silently defeat the anchoring: "/v1/ok)|(.*" compiles as
+		// \A(?:/v1/ok)|(.*)\z, whose second alternative is unanchored and
+		// matches every path — turning an ALLOW rule into allow-all.
+		if _, err := regexp.Compile(input.PathRegex); err != nil {
+			return accessRule{}, fmt.Errorf("invalid path_regex %q: %w", input.PathRegex, err)
+		}
+		// Wrap as \A(?:user)\z so the user pattern is fully anchored
+		// regardless of any internal alternations like "foo|bar". User-supplied
+		// ^/$ anchors are harmless inside the non-capturing group.
+		wrapped := `\A(?:` + input.PathRegex + `)\z`
+		re, err := regexp.Compile(wrapped)
+		if err != nil {
+			return accessRule{}, fmt.Errorf("invalid path_regex %q: %w", input.PathRegex, err)
+		}
+		return accessRule{action: act, method: input.Method, regex: re}, nil
 	}
 
 	return accessRule{action: act, method: input.Method, pattern: input.Path}, nil
+}
+
+// normalizePath rewrites a request path into the canonical form regex rules see:
+// single leading slash, no trailing slash (root stays "/"), interior "//" collapsed.
+// This keeps regex semantics consistent with glob — both run against the same shape.
+func normalizePath(p string) string {
+	parts := splitPath(p)
+	if len(parts) == 0 {
+		return "/"
+	}
+	return "/" + strings.Join(parts, "/")
 }
 
 func isValidMethod(s string) bool {
