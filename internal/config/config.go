@@ -103,7 +103,7 @@ type AccessRuleConfig struct {
 	Action    string `yaml:"action"`                // ALLOW or DENY
 	Method    string `yaml:"method"`                // GET, POST, DELETE, ALL, etc.
 	Path      string `yaml:"path,omitempty"`        // glob pattern: /users/*/detail, /repos/**
-	PathRegex string `yaml:"path_regex,omitempty"`  // RE2 regex: /rest/api/3/issue/AI-\d+
+	PathRegex string `yaml:"path_regex,omitempty"`  // RE2 regex: /v1/records/REC-\d+
 }
 
 // MaxPathRegexLen caps the length of a path_regex pattern at config load.

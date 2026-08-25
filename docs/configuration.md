@@ -222,7 +222,7 @@ token is not forwarded to the upstream:
 
 ```yaml
 - path_prefix: "/media"
-  upstream: "https://api.media.atlassian.com"
+  upstream: "https://cdn.example.com"
   strip_prefix: "/media"
   strip_agent_auth: true
   auth:

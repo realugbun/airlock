@@ -326,30 +326,30 @@ func regexRule(action, method, pattern string) AccessRuleInput {
 
 func TestAccess_PathRegex_BasicMatch(t *testing.T) {
 	p, err := NewAccessPolicy([]AccessRuleInput{
-		regexRule("ALLOW", "PUT", `/rest/api/3/issue/AI-\d+`),
+		regexRule("ALLOW", "PUT", `/v1/records/REC-\d+`),
 		rule("DENY", "ALL", "/**"),
 	}, false)
 	require.NoError(t, err)
 
-	assert.True(t, p.Allowed("PUT", "/rest/api/3/issue/AI-1234"))
-	assert.True(t, p.Allowed("PUT", "/rest/api/3/issue/AI-1"))
-	assert.False(t, p.Allowed("PUT", "/rest/api/3/issue/BACK-1234"), "non-AI key denied")
-	assert.False(t, p.Allowed("PUT", "/rest/api/3/issue/AI-"), "empty number denied")
-	assert.False(t, p.Allowed("PUT", "/rest/api/3/issue/AI-abc"), "non-digit denied")
+	assert.True(t, p.Allowed("PUT", "/v1/records/REC-1234"))
+	assert.True(t, p.Allowed("PUT", "/v1/records/REC-1"))
+	assert.False(t, p.Allowed("PUT", "/v1/records/BACK-1234"), "non-AI key denied")
+	assert.False(t, p.Allowed("PUT", "/v1/records/AI-"), "empty number denied")
+	assert.False(t, p.Allowed("PUT", "/v1/records/AI-abc"), "non-digit denied")
 }
 
 func TestAccess_PathRegex_FullMatchAnchoring(t *testing.T) {
 	// Implicit \A...\z anchoring must reject prefix-only or suffix-only matches.
 	p, err := NewAccessPolicy([]AccessRuleInput{
-		regexRule("ALLOW", "GET", `/rest/api/3/issue/AI-\d+`),
+		regexRule("ALLOW", "GET", `/v1/records/REC-\d+`),
 		rule("DENY", "ALL", "/**"),
 	}, false)
 	require.NoError(t, err)
 
-	assert.True(t, p.Allowed("GET", "/rest/api/3/issue/AI-42"))
+	assert.True(t, p.Allowed("GET", "/v1/records/REC-42"))
 	// Suffix path beyond regex must be denied — anchored full-match only.
-	assert.False(t, p.Allowed("GET", "/rest/api/3/issue/AI-42/comment"))
-	assert.False(t, p.Allowed("GET", "/prefix/rest/api/3/issue/AI-42"))
+	assert.False(t, p.Allowed("GET", "/v1/records/REC-42/comment"))
+	assert.False(t, p.Allowed("GET", "/prefix/v1/records/REC-42"))
 }
 
 func TestAccess_PathRegex_AlternationAnchoredAsGroup(t *testing.T) {
@@ -383,14 +383,14 @@ func TestAccess_PathRegex_UserSuppliedAnchorsHarmless(t *testing.T) {
 func TestAccess_PathRegex_NormalizedAgainstInteriorDoubleSlash(t *testing.T) {
 	// Regex sees the same normalized path that glob sees: interior // collapsed.
 	p, err := NewAccessPolicy([]AccessRuleInput{
-		regexRule("ALLOW", "GET", `/rest/api/3/issue/AI-\d+`),
+		regexRule("ALLOW", "GET", `/v1/records/REC-\d+`),
 		rule("DENY", "ALL", "/**"),
 	}, false)
 	require.NoError(t, err)
 
-	assert.True(t, p.Allowed("GET", "/rest/api/3/issue/AI-7"))
-	assert.True(t, p.Allowed("GET", "/rest/api/3//issue/AI-7"), "interior // must be normalized before regex")
-	assert.True(t, p.Allowed("GET", "//rest/api/3/issue/AI-7"))
+	assert.True(t, p.Allowed("GET", "/v1/records/REC-7"))
+	assert.True(t, p.Allowed("GET", "/v1//records/REC-7"), "interior // must be normalized before regex")
+	assert.True(t, p.Allowed("GET", "//v1/records/REC-7"))
 }
 
 func TestAccess_PathRegex_MethodSemanticsUnchanged(t *testing.T) {
@@ -412,17 +412,17 @@ func TestAccess_PathRegex_MethodSemanticsUnchanged(t *testing.T) {
 func TestAccess_PathRegex_GlobAndRegexInterop(t *testing.T) {
 	// Mixed rule list: glob and regex coexist. First match wins, ordering preserved.
 	p, err := NewAccessPolicy([]AccessRuleInput{
-		regexRule("DENY", "PUT", `/rest/api/3/issue/AI-\d+/secret`),
-		regexRule("ALLOW", "PUT", `/rest/api/3/issue/AI-\d+`),
-		rule("ALLOW", "GET", "/rest/api/3/myself"),
+		regexRule("DENY", "PUT", `/v1/records/REC-\d+/secret`),
+		regexRule("ALLOW", "PUT", `/v1/records/REC-\d+`),
+		rule("ALLOW", "GET", "/v1/myself"),
 		rule("DENY", "ALL", "/**"),
 	}, false)
 	require.NoError(t, err)
 
-	assert.True(t, p.Allowed("PUT", "/rest/api/3/issue/AI-1"))
-	assert.False(t, p.Allowed("PUT", "/rest/api/3/issue/AI-1/secret"), "deny regex before allow regex wins")
-	assert.True(t, p.Allowed("GET", "/rest/api/3/myself"))
-	assert.False(t, p.Allowed("PUT", "/rest/api/3/myself"))
+	assert.True(t, p.Allowed("PUT", "/v1/records/REC-1"))
+	assert.False(t, p.Allowed("PUT", "/v1/records/REC-1/secret"), "deny regex before allow regex wins")
+	assert.True(t, p.Allowed("GET", "/v1/myself"))
+	assert.False(t, p.Allowed("PUT", "/v1/myself"))
 }
 
 func TestAccess_PathRegex_InvalidPatternRejected(t *testing.T) {
@@ -525,15 +525,15 @@ func TestAccess_PathRegexRejectsAnchorEscapingPattern(t *testing.T) {
 // stay anchored.
 func TestAccess_PathRegexStillAnchorsValidPatterns(t *testing.T) {
 	p, err := NewAccessPolicy([]AccessRuleInput{
-		{Action: "ALLOW", Method: "PUT", PathRegex: `/rest/api/3/issue/AI-\d+`},
+		{Action: "ALLOW", Method: "PUT", PathRegex: `/v1/records/REC-\d+`},
 		{Action: "DENY", Method: "ALL", Path: "/**"},
 	}, false)
 	require.NoError(t, err)
 
-	assert.True(t, p.Allowed("PUT", "/rest/api/3/issue/AI-283"))
-	assert.False(t, p.Allowed("PUT", "/rest/api/3/issue/BACK-1"), "other projects must not match")
-	assert.False(t, p.Allowed("PUT", "/x/rest/api/3/issue/AI-1"), "prefix must not match (anchored)")
-	assert.False(t, p.Allowed("PUT", "/rest/api/3/issue/AI-1/extra"), "suffix must not match (anchored)")
+	assert.True(t, p.Allowed("PUT", "/v1/records/REC-283"))
+	assert.False(t, p.Allowed("PUT", "/v1/records/BACK-1"), "other projects must not match")
+	assert.False(t, p.Allowed("PUT", "/x/v1/records/REC-1"), "prefix must not match (anchored)")
+	assert.False(t, p.Allowed("PUT", "/v1/records/REC-1/extra"), "suffix must not match (anchored)")
 	// Internal alternation must not escape the wrapper.
 	p2, err := NewAccessPolicy([]AccessRuleInput{
 		{Action: "ALLOW", Method: "GET", PathRegex: `/a|/b`},

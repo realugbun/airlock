@@ -65,23 +65,23 @@ Each access rule must specify exactly one of `path` (glob) or `path_regex` (RE2 
 **When to use which:**
 
 - **Default to `path`.** Glob is segment-based, easier to read, and protected by the bounded DP matcher described above. Use it for the common case (whole-segment matches, prefixes, simple wildcards).
-- **Use `path_regex` only when you need within-segment constraints** that glob cannot express — for example, restricting writes to issue keys matching `AI-\d+` while leaving reads unrestricted.
+- **Use `path_regex` only when you need within-segment constraints** that glob cannot express — for example, restricting writes to issue keys matching `REC-\d+` while leaving reads unrestricted.
 
-**Example — restrict Jira writes to AI-prefixed tickets:**
+**Example: restrict writes to a single record prefix**
 
 ```yaml
 access_rules:
-  - { action: ALLOW, method: GET,  path: /rest/api/3/search/jql }
-  - { action: ALLOW, method: PUT,  path_regex: '/rest/api/3/issue/AI-\d+' }
-  - { action: ALLOW, method: GET,  path_regex: '/rest/api/3/issue/AI-\d+' }
-  - { action: ALLOW, method: POST, path_regex: '/rest/api/3/issue/AI-\d+/comment' }
+  - { action: ALLOW, method: GET,  path: /v1/search/jql }
+  - { action: ALLOW, method: PUT,  path_regex: '/v1/records/REC-\d+' }
+  - { action: ALLOW, method: GET,  path_regex: '/v1/records/REC-\d+' }
+  - { action: ALLOW, method: POST, path_regex: '/v1/records/REC-\d+/comment' }
   - { action: DENY,  method: ALL,  path: /** }
 ```
 
 ### Semantics
 
 - **Implicit full-match anchoring.** Every `path_regex` is wrapped as `\A(?:<your_pattern>)\z` before compilation. Your pattern must match the entire path, not a prefix or substring. Adding your own `^` or `$` is harmless but redundant. The wrapping is non-capturing, which means alternations like `path_regex: 'foo|bar'` behave as `(?:foo|bar)` against the full path — neither branch matches `/prefix/foo` or `/foo/extra`.
-- **Same normalized path as glob.** The regex runs against the same normalized path glob sees: leading `/`, no trailing `/` (root stays `/`), interior `//` collapsed. A request to `/rest/api/3//issue/AI-1` matches `path_regex: '/rest/api/3/issue/AI-\d+'` for the same reason it would match the equivalent glob.
+- **Same normalized path as glob.** The regex runs against the same normalized path glob sees: leading `/`, no trailing `/` (root stays `/`), interior `//` collapsed. A request to `/v1//records/REC-1` matches `path_regex: '/v1/records/REC-\d+'` for the same reason it would match the equivalent glob.
 - **First-match ordering is preserved.** Regex and glob rules can be mixed freely in the same `access_rules` list. Rules are still evaluated top-to-bottom, first match wins, with implicit deny at the end if rules are defined.
 - **Method semantics are unchanged.** `method: ALL` matches any verb; specific methods only match that verb. Regex applies to the path only — there is no method regex.
 

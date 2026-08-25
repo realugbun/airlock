@@ -1408,7 +1408,7 @@ func TestIntegration_ExtraHeaders_Injected(t *testing.T) {
 
 // Reproduces the Maya use case: PUT to AI-<digits> issues reaches the upstream;
 // PUT to BACK-<digits> is denied at the gateway with 403.
-func TestIntegration_PathRegex_JiraIssueWriteRestriction(t *testing.T) {
+func TestIntegration_PathRegex_RecordWriteRestriction(t *testing.T) {
 	var hits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -1421,10 +1421,10 @@ func TestIntegration_PathRegex_JiraIssueWriteRestriction(t *testing.T) {
 	require.NoError(t, err)
 
 	access, err := NewAccessPolicy([]AccessRuleInput{
-		{Action: "ALLOW", Method: "GET", Path: "/rest/api/3/myself"},
-		{Action: "ALLOW", Method: "PUT", PathRegex: `/rest/api/3/issue/AI-\d+`},
-		{Action: "ALLOW", Method: "GET", PathRegex: `/rest/api/3/issue/AI-\d+`},
-		{Action: "ALLOW", Method: "POST", PathRegex: `/rest/api/3/issue/AI-\d+/comment`},
+		{Action: "ALLOW", Method: "GET", Path: "/v1/myself"},
+		{Action: "ALLOW", Method: "PUT", PathRegex: `/v1/records/REC-\d+`},
+		{Action: "ALLOW", Method: "GET", PathRegex: `/v1/records/REC-\d+`},
+		{Action: "ALLOW", Method: "POST", PathRegex: `/v1/records/REC-\d+/comment`},
 		{Action: "DENY", Method: "ALL", Path: "/**"},
 	}, false)
 	require.NoError(t, err)
@@ -1432,8 +1432,8 @@ func TestIntegration_PathRegex_JiraIssueWriteRestriction(t *testing.T) {
 	logger := airlocklog.NewLogger(devNull{}, "test", "test-agent")
 	router := NewRouter(RouterConfig{AgentID: "test-agent", Logger: logger})
 	router.AddRoute(&Route{
-		PathPrefix:  "/jira",
-		StripPrefix: "/jira",
+		PathPrefix:  "/upstream",
+		StripPrefix: "/upstream",
 		Upstream:    upURL,
 		Auth:        &noopAuth{},
 		Access:      access,
@@ -1448,14 +1448,14 @@ func TestIntegration_PathRegex_JiraIssueWriteRestriction(t *testing.T) {
 		wantStatus int
 		wantUpHit  bool
 	}{
-		{"PUT AI-1234 reaches upstream", "PUT", "/jira/rest/api/3/issue/AI-1234", http.StatusOK, true},
-		{"PUT BACK-1234 denied at gateway", "PUT", "/jira/rest/api/3/issue/BACK-1234", http.StatusForbidden, false},
-		{"GET AI-9 reaches upstream", "GET", "/jira/rest/api/3/issue/AI-9", http.StatusOK, true},
-		{"GET BACK-9 denied at gateway", "GET", "/jira/rest/api/3/issue/BACK-9", http.StatusForbidden, false},
-		{"POST AI-1/comment reaches upstream", "POST", "/jira/rest/api/3/issue/AI-1/comment", http.StatusOK, true},
-		{"DELETE AI-1 denied (no rule matches verb)", "DELETE", "/jira/rest/api/3/issue/AI-1", http.StatusForbidden, false},
-		{"GET myself reaches upstream (glob rule)", "GET", "/jira/rest/api/3/myself", http.StatusOK, true},
-		{"GET unrelated denied", "GET", "/jira/rest/api/3/project", http.StatusForbidden, false},
+		{"PUT REC-1234 reaches upstream", "PUT", "/upstream/v1/records/REC-1234", http.StatusOK, true},
+		{"PUT BACK-1234 denied at gateway", "PUT", "/upstream/v1/records/BACK-1234", http.StatusForbidden, false},
+		{"GET REC-9 reaches upstream", "GET", "/upstream/v1/records/REC-9", http.StatusOK, true},
+		{"GET BACK-9 denied at gateway", "GET", "/upstream/v1/records/BACK-9", http.StatusForbidden, false},
+		{"POST REC-1/comment reaches upstream", "POST", "/upstream/v1/records/REC-1/comment", http.StatusOK, true},
+		{"DELETE REC-1 denied (no rule matches verb)", "DELETE", "/upstream/v1/records/REC-1", http.StatusForbidden, false},
+		{"GET myself reaches upstream (glob rule)", "GET", "/upstream/v1/myself", http.StatusOK, true},
+		{"GET unrelated denied", "GET", "/upstream/v1/project", http.StatusForbidden, false},
 	}
 
 	for _, tc := range cases {

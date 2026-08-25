@@ -522,8 +522,8 @@ service: "test-svc"
 providers:
   env: {}
 routes:
-  - path_prefix: "/jira"
-    upstream: "https://api.atlassian.com"
+  - path_prefix: "/upstream"
+    upstream: "https://api.example.com"
     auth:
       type: static
       token:
@@ -532,14 +532,14 @@ routes:
       header: "Authorization"
       prefix: "Bearer "
     access_rules:
-      - { action: ALLOW, method: PUT, path_regex: '/rest/api/3/issue/AI-\d+' }
+      - { action: ALLOW, method: PUT, path_regex: '/v1/records/REC-\d+' }
       - { action: DENY,  method: ALL, path: /** }
 `
 	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
 
 	cfg, err := Load(path)
 	require.NoError(t, err)
-	assert.Equal(t, `/rest/api/3/issue/AI-\d+`, cfg.Routes[0].AccessRules[0].PathRegex)
+	assert.Equal(t, `/v1/records/REC-\d+`, cfg.Routes[0].AccessRules[0].PathRegex)
 	assert.Equal(t, "", cfg.Routes[0].AccessRules[0].Path)
 }
 
@@ -551,8 +551,8 @@ service: "test-svc"
 providers:
   env: {}
 routes:
-  - path_prefix: "/jira"
-    upstream: "https://api.atlassian.com"
+  - path_prefix: "/upstream"
+    upstream: "https://api.example.com"
     auth:
       type: static
       token:
@@ -568,7 +568,7 @@ routes:
 	_, err := Load(path)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "only one of path or path_regex")
-	assert.Contains(t, err.Error(), "/jira")
+	assert.Contains(t, err.Error(), "/upstream")
 	assert.Contains(t, err.Error(), "access_rules[0]")
 }
 
@@ -580,8 +580,8 @@ service: "test-svc"
 providers:
   env: {}
 routes:
-  - path_prefix: "/jira"
-    upstream: "https://api.atlassian.com"
+  - path_prefix: "/upstream"
+    upstream: "https://api.example.com"
     auth:
       type: static
       token:
@@ -611,8 +611,8 @@ service: "test-svc"
 providers:
   env: {}
 routes:
-  - path_prefix: "/jira"
-    upstream: "https://api.atlassian.com"
+  - path_prefix: "/upstream"
+    upstream: "https://api.example.com"
     auth:
       type: static
       token:
@@ -640,7 +640,7 @@ providers:
   env: {}
 routes:
   - path_prefix: "/media"
-    upstream: "https://api.media.atlassian.com"
+    upstream: "https://cdn.example.com"
     strip_prefix: "/media"
     strip_agent_auth: true
 ` + authBlock + `
