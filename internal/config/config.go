@@ -95,11 +95,21 @@ type RouteConfig struct {
 }
 
 // AccessRuleConfig is a single firewall-style access rule.
+//
+// Exactly one of Path or PathRegex must be set:
+//   - Path: glob pattern (segment-based; * matches one segment, ** matches zero or more)
+//   - PathRegex: Go RE2 regex (full-match anchored automatically; no lookahead/backrefs)
 type AccessRuleConfig struct {
-	Action string `yaml:"action"` // ALLOW or DENY
-	Method string `yaml:"method"` // GET, POST, DELETE, ALL, etc.
-	Path   string `yaml:"path"`   // glob pattern: /users/*/detail, /repos/**
+	Action    string `yaml:"action"`                // ALLOW or DENY
+	Method    string `yaml:"method"`                // GET, POST, DELETE, ALL, etc.
+	Path      string `yaml:"path,omitempty"`        // glob pattern: /users/*/detail, /repos/**
+	PathRegex string `yaml:"path_regex,omitempty"`  // RE2 regex: /v1/records/REC-\d+
 }
+
+// MaxPathRegexLen caps the length of a path_regex pattern at config load.
+// RE2 prevents catastrophic backtracking, but a multi-kilobyte regex is almost
+// certainly a config mistake or an attempt to abuse the loader.
+const MaxPathRegexLen = 512
 
 // AuthConfig defines authentication for a route.
 type AuthConfig struct {
@@ -180,10 +190,23 @@ func (c *Config) validate() error {
 			if r.Auth.TokenURL == "" {
 				return fmt.Errorf("route %d: auth.token_url is required for oauth2 auth", i)
 			}
+		case "none":
+			// Passthrough: no credential is injected. Reject any credential or
+			// header field so a config that *looks* like it authenticates can
+			// never be silently ignored.
+			if r.Auth.Token != nil || r.Auth.ClientID != nil || r.Auth.ClientSecret != nil || r.Auth.RefreshToken != nil {
+				return fmt.Errorf("route %d: auth.type \"none\" injects no credential, so token/client_id/client_secret/refresh_token must not be set", i)
+			}
+			if r.Auth.TokenURL != "" || r.Auth.Scopes != "" {
+				return fmt.Errorf("route %d: auth.type \"none\" injects no credential, so token_url/scopes must not be set", i)
+			}
+			if r.Auth.Header != "" || r.Auth.Prefix != "" {
+				return fmt.Errorf("route %d: auth.type \"none\" injects no credential, so auth.header/auth.prefix must not be set", i)
+			}
 		default:
 			return fmt.Errorf("route %d: unknown auth type %q", i, r.Auth.Type)
 		}
-		if r.Auth.Header == "" {
+		if r.Auth.Type != "none" && r.Auth.Header == "" {
 			return fmt.Errorf("route %d: auth.header is required", i)
 		}
 		if r.MCPRules != nil && len(r.MCPRules.AllowedTools) > 0 && len(r.MCPRules.DeniedTools) > 0 {
@@ -191,6 +214,19 @@ func (c *Config) validate() error {
 		}
 		if c.IsStrict() && r.AccessRules == nil {
 			return fmt.Errorf("route %d (%s): access_rules required when strict mode is enabled (default); set strict: false to allow routes without access rules", i, r.PathPrefix)
+		}
+		for j, ar := range r.AccessRules {
+			hasPath := ar.Path != ""
+			hasRegex := ar.PathRegex != ""
+			if hasPath && hasRegex {
+				return fmt.Errorf("route %d (%s) access_rules[%d]: only one of path or path_regex may be set", i, r.PathPrefix, j)
+			}
+			if !hasPath && !hasRegex {
+				return fmt.Errorf("route %d (%s) access_rules[%d]: one of path or path_regex is required", i, r.PathPrefix, j)
+			}
+			if hasRegex && len(ar.PathRegex) > MaxPathRegexLen {
+				return fmt.Errorf("route %d (%s) access_rules[%d]: path_regex exceeds %d characters", i, r.PathPrefix, j, MaxPathRegexLen)
+			}
 		}
 	}
 

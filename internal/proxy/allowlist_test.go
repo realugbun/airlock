@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -222,7 +223,7 @@ func TestAccess_ErrorMissingPath(t *testing.T) {
 		{Action: "ALLOW", Method: "GET", Path: ""},
 	}, false)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "path is required")
+	assert.Contains(t, err.Error(), "one of path or path_regex is required")
 }
 
 // --- DP Matcher Correctness ---
@@ -312,4 +313,233 @@ func TestSplitPath_Normalization(t *testing.T) {
 		got := splitPath(tt.input)
 		assert.Equal(t, tt.want, got, "splitPath(%q)", tt.input)
 	}
+}
+
+// =============================================================================
+// path_regex matching
+// =============================================================================
+
+// regexRule constructs an AccessRuleInput that uses path_regex.
+func regexRule(action, method, pattern string) AccessRuleInput {
+	return AccessRuleInput{Action: action, Method: method, PathRegex: pattern}
+}
+
+func TestAccess_PathRegex_BasicMatch(t *testing.T) {
+	p, err := NewAccessPolicy([]AccessRuleInput{
+		regexRule("ALLOW", "PUT", `/v1/records/REC-\d+`),
+		rule("DENY", "ALL", "/**"),
+	}, false)
+	require.NoError(t, err)
+
+	assert.True(t, p.Allowed("PUT", "/v1/records/REC-1234"))
+	assert.True(t, p.Allowed("PUT", "/v1/records/REC-1"))
+	assert.False(t, p.Allowed("PUT", "/v1/records/BACK-1234"), "non-AI key denied")
+	assert.False(t, p.Allowed("PUT", "/v1/records/AI-"), "empty number denied")
+	assert.False(t, p.Allowed("PUT", "/v1/records/AI-abc"), "non-digit denied")
+}
+
+func TestAccess_PathRegex_FullMatchAnchoring(t *testing.T) {
+	// Implicit \A...\z anchoring must reject prefix-only or suffix-only matches.
+	p, err := NewAccessPolicy([]AccessRuleInput{
+		regexRule("ALLOW", "GET", `/v1/records/REC-\d+`),
+		rule("DENY", "ALL", "/**"),
+	}, false)
+	require.NoError(t, err)
+
+	assert.True(t, p.Allowed("GET", "/v1/records/REC-42"))
+	// Suffix path beyond regex must be denied — anchored full-match only.
+	assert.False(t, p.Allowed("GET", "/v1/records/REC-42/comment"))
+	assert.False(t, p.Allowed("GET", "/prefix/v1/records/REC-42"))
+}
+
+func TestAccess_PathRegex_AlternationAnchoredAsGroup(t *testing.T) {
+	// "foo|bar" must NOT match a path containing "foo" or ending in "bar".
+	// The wrapper \A(?:foo|bar)\z makes both branches fully anchored.
+	p, err := NewAccessPolicy([]AccessRuleInput{
+		regexRule("ALLOW", "GET", `/foo|/bar`),
+		rule("DENY", "ALL", "/**"),
+	}, false)
+	require.NoError(t, err)
+
+	assert.True(t, p.Allowed("GET", "/foo"))
+	assert.True(t, p.Allowed("GET", "/bar"))
+	assert.False(t, p.Allowed("GET", "/prefix/foo"), "prefix path must not match anchored alternation")
+	assert.False(t, p.Allowed("GET", "/foo/extra"), "suffix path must not match anchored alternation")
+	assert.False(t, p.Allowed("GET", "/bar/extra"))
+}
+
+func TestAccess_PathRegex_UserSuppliedAnchorsHarmless(t *testing.T) {
+	// User-supplied ^...$ inside the wrapped group is redundant but should not break.
+	p, err := NewAccessPolicy([]AccessRuleInput{
+		regexRule("ALLOW", "GET", `^/foo$`),
+		rule("DENY", "ALL", "/**"),
+	}, false)
+	require.NoError(t, err)
+
+	assert.True(t, p.Allowed("GET", "/foo"))
+	assert.False(t, p.Allowed("GET", "/foo/bar"))
+}
+
+func TestAccess_PathRegex_NormalizedAgainstInteriorDoubleSlash(t *testing.T) {
+	// Regex sees the same normalized path that glob sees: interior // collapsed.
+	p, err := NewAccessPolicy([]AccessRuleInput{
+		regexRule("ALLOW", "GET", `/v1/records/REC-\d+`),
+		rule("DENY", "ALL", "/**"),
+	}, false)
+	require.NoError(t, err)
+
+	assert.True(t, p.Allowed("GET", "/v1/records/REC-7"))
+	assert.True(t, p.Allowed("GET", "/v1//records/REC-7"), "interior // must be normalized before regex")
+	assert.True(t, p.Allowed("GET", "//v1/records/REC-7"))
+}
+
+func TestAccess_PathRegex_MethodSemanticsUnchanged(t *testing.T) {
+	// Regex rule with method: ALL allows any verb; specific method only matches that verb.
+	p, err := NewAccessPolicy([]AccessRuleInput{
+		regexRule("ALLOW", "ALL", `/health/\w+`),
+		regexRule("ALLOW", "GET", `/items/\d+`),
+		rule("DENY", "ALL", "/**"),
+	}, false)
+	require.NoError(t, err)
+
+	assert.True(t, p.Allowed("GET", "/health/live"))
+	assert.True(t, p.Allowed("POST", "/health/live"))
+	assert.True(t, p.Allowed("DELETE", "/health/live"))
+	assert.True(t, p.Allowed("GET", "/items/42"))
+	assert.False(t, p.Allowed("POST", "/items/42"), "method-bound regex must not match other verbs")
+}
+
+func TestAccess_PathRegex_GlobAndRegexInterop(t *testing.T) {
+	// Mixed rule list: glob and regex coexist. First match wins, ordering preserved.
+	p, err := NewAccessPolicy([]AccessRuleInput{
+		regexRule("DENY", "PUT", `/v1/records/REC-\d+/secret`),
+		regexRule("ALLOW", "PUT", `/v1/records/REC-\d+`),
+		rule("ALLOW", "GET", "/v1/myself"),
+		rule("DENY", "ALL", "/**"),
+	}, false)
+	require.NoError(t, err)
+
+	assert.True(t, p.Allowed("PUT", "/v1/records/REC-1"))
+	assert.False(t, p.Allowed("PUT", "/v1/records/REC-1/secret"), "deny regex before allow regex wins")
+	assert.True(t, p.Allowed("GET", "/v1/myself"))
+	assert.False(t, p.Allowed("PUT", "/v1/myself"))
+}
+
+func TestAccess_PathRegex_InvalidPatternRejected(t *testing.T) {
+	_, err := NewAccessPolicy([]AccessRuleInput{
+		regexRule("ALLOW", "GET", `[unterminated`),
+	}, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "access_rules[0]")
+	assert.Contains(t, err.Error(), "path_regex")
+}
+
+func TestAccess_PathRegex_BothPathAndRegexRejected(t *testing.T) {
+	_, err := NewAccessPolicy([]AccessRuleInput{
+		{Action: "ALLOW", Method: "GET", Path: "/foo", PathRegex: `/foo`},
+	}, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only one of path or path_regex")
+}
+
+func TestAccess_PathRegex_NeitherPathNorRegexRejected(t *testing.T) {
+	_, err := NewAccessPolicy([]AccessRuleInput{
+		{Action: "ALLOW", Method: "GET"},
+	}, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "one of path or path_regex is required")
+}
+
+func TestAccess_PathRegex_LengthCapEnforced(t *testing.T) {
+	long := strings.Repeat("a", MaxPathRegexLen+1)
+	_, err := NewAccessPolicy([]AccessRuleInput{
+		regexRule("ALLOW", "GET", "/"+long),
+	}, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds")
+}
+
+func TestNormalizePath(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"/v1/chat", "/v1/chat"},
+		{"v1/chat", "/v1/chat"},
+		{"/v1//chat", "/v1/chat"},
+		{"//v1/chat//", "/v1/chat"},
+		{"/", "/"},
+		{"", "/"},
+		{"///", "/"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, normalizePath(tt.in), "normalizePath(%q)", tt.in)
+	}
+}
+
+// --- v0.2.0 regression: mixed glob/regex matchers must not fail open ---
+
+// matchSegments caps only the rule it is evaluating, so before the central cap
+// an overlong path failed every glob rule — including a trailing DENY — and
+// then fell through to a later ALLOW path_regex, which has no cap. That is a
+// fail-open bypass that only exists once both matchers coexist.
+func TestAccess_OverlongPathDoesNotBypassDenyGlobViaAllowRegex(t *testing.T) {
+	p, err := NewAccessPolicy([]AccessRuleInput{
+		{Action: "DENY", Method: "ALL", Path: "/admin/**"},
+		{Action: "ALLOW", Method: "ALL", PathRegex: `/.+`},
+	}, false)
+	require.NoError(t, err)
+
+	// Well under the cap: the DENY glob matches and wins.
+	assert.False(t, p.Allowed("GET", "/admin/users"), "short admin path must be denied")
+	// Non-admin short path is allowed by the regex — the rule set is meaningful.
+	assert.True(t, p.Allowed("GET", "/public/thing"), "short non-admin path should be allowed")
+
+	// Over the 256-segment cap: must NOT become allow-all.
+	overlong := "/admin/" + strings.Repeat("x/", maxPathSegments+1)
+	assert.False(t, p.Allowed("GET", overlong), "overlong admin path must not bypass DENY via the ALLOW regex")
+
+	// The cap applies to the whole request, not just admin paths.
+	assert.False(t, p.Allowed("GET", "/public/"+strings.Repeat("y/", maxPathSegments+1)),
+		"any path over the segment cap must be refused")
+}
+
+// An unbalanced ")" re-parenthesises the \A(?:...)\z wrapper: "/v1/ok)|(.*"
+// compiles as \A(?:/v1/ok)|(.*)\z, whose second alternative is unanchored and
+// matches every path — silently turning an ALLOW rule into allow-all.
+func TestAccess_PathRegexRejectsAnchorEscapingPattern(t *testing.T) {
+	for _, pattern := range []string{
+		`/v1/ok)|(.*`,
+		`/v1/ok)\z|\A(?:.*`,
+	} {
+		t.Run(pattern, func(t *testing.T) {
+			_, err := NewAccessPolicy([]AccessRuleInput{
+				{Action: "ALLOW", Method: "GET", PathRegex: pattern},
+			}, false)
+			require.Error(t, err, "anchor-escaping pattern must be rejected at construction")
+			assert.Contains(t, err.Error(), "invalid path_regex")
+		})
+	}
+}
+
+// Guard the fix from over-reaching: legitimate patterns must still build and
+// stay anchored.
+func TestAccess_PathRegexStillAnchorsValidPatterns(t *testing.T) {
+	p, err := NewAccessPolicy([]AccessRuleInput{
+		{Action: "ALLOW", Method: "PUT", PathRegex: `/v1/records/REC-\d+`},
+		{Action: "DENY", Method: "ALL", Path: "/**"},
+	}, false)
+	require.NoError(t, err)
+
+	assert.True(t, p.Allowed("PUT", "/v1/records/REC-283"))
+	assert.False(t, p.Allowed("PUT", "/v1/records/BACK-1"), "other projects must not match")
+	assert.False(t, p.Allowed("PUT", "/x/v1/records/REC-1"), "prefix must not match (anchored)")
+	assert.False(t, p.Allowed("PUT", "/v1/records/REC-1/extra"), "suffix must not match (anchored)")
+	// Internal alternation must not escape the wrapper.
+	p2, err := NewAccessPolicy([]AccessRuleInput{
+		{Action: "ALLOW", Method: "GET", PathRegex: `/a|/b`},
+	}, false)
+	require.NoError(t, err)
+	assert.True(t, p2.Allowed("GET", "/a"))
+	assert.True(t, p2.Allowed("GET", "/b"))
+	assert.False(t, p2.Allowed("GET", "/a/c"), "alternation must remain fully anchored")
 }

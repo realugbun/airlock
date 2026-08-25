@@ -43,7 +43,7 @@ routes:
       X-Custom: "value"
 
     auth:
-      type: static                    # "static" or "oauth2"
+      type: static                    # "static", "oauth2", or "none"
       token:                          # Secret reference
         from: env                     #   Provider name
         path: ""                      #   Secret path (provider-specific)
@@ -196,6 +196,45 @@ auth:
 ```
 
 Airlock refreshes the access token automatically before it expires.
+
+### None (Passthrough)
+
+Injects no credential. Use it for an upstream that carries its own authorization
+inside the request the agent already holds — a pre-signed URL whose query string
+contains a short-lived token, or a redirect target on a CDN host. Sending an
+unrelated credential to such a host would be needless exposure, but the route
+still needs to run through the gateway so that access rules, rate limiting and
+egress control apply.
+
+```yaml
+auth:
+  type: none
+```
+
+`none` takes no other fields. Setting `token`, `client_id`, `client_secret`,
+`refresh_token`, `token_url`, `scopes`, `header` or `prefix` alongside it is a
+config error and fails at startup — a route that names a credential but injects
+nothing is almost always a mistake, and a silent one.
+
+`strip_agent_auth` is independent of the auth type. A `none` route can, and
+usually should, still strip the agent's own `Authorization` header so the agent's
+token is not forwarded to the upstream:
+
+```yaml
+- path_prefix: "/media"
+  upstream: "https://cdn.example.com"
+  strip_prefix: "/media"
+  strip_agent_auth: true
+  auth:
+    type: none
+  access_rules:
+    - action: ALLOW
+      method: GET
+      path: /file/*/binary
+    - action: DENY
+      method: ALL
+      path: /**
+```
 
 ## Response Security
 

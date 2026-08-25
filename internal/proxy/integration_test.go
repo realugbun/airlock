@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/realugbun/airlock/internal/auth"
 	airlocklog "github.com/realugbun/airlock/pkg/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1398,4 +1400,267 @@ func TestIntegration_ExtraHeaders_Injected(t *testing.T) {
 	assert.Equal(t, "oauth-2025-04-20", receivedHeaders.Get("anthropic-beta"))
 	assert.Equal(t, "2023-06-01", receivedHeaders.Get("anthropic-version"))
 	assert.Equal(t, "value", receivedHeaders.Get("X-Custom"))
+}
+
+// =============================================================================
+// path_regex end-to-end (mirrors the spec's curl reproducer)
+// =============================================================================
+
+// Reproduces the Maya use case: PUT to AI-<digits> issues reaches the upstream;
+// PUT to BACK-<digits> is denied at the gateway with 403.
+func TestIntegration_PathRegex_RecordWriteRestriction(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("upstream:" + r.Method + ":" + r.URL.Path))
+	}))
+	defer upstream.Close()
+
+	upURL, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+
+	access, err := NewAccessPolicy([]AccessRuleInput{
+		{Action: "ALLOW", Method: "GET", Path: "/v1/myself"},
+		{Action: "ALLOW", Method: "PUT", PathRegex: `/v1/records/REC-\d+`},
+		{Action: "ALLOW", Method: "GET", PathRegex: `/v1/records/REC-\d+`},
+		{Action: "ALLOW", Method: "POST", PathRegex: `/v1/records/REC-\d+/comment`},
+		{Action: "DENY", Method: "ALL", Path: "/**"},
+	}, false)
+	require.NoError(t, err)
+
+	logger := airlocklog.NewLogger(devNull{}, "test", "test-agent")
+	router := NewRouter(RouterConfig{AgentID: "test-agent", Logger: logger})
+	router.AddRoute(&Route{
+		PathPrefix:  "/upstream",
+		StripPrefix: "/upstream",
+		Upstream:    upURL,
+		Auth:        &noopAuth{},
+		Access:      access,
+	})
+
+	ctx := airlocklog.WithCorrelationID(context.Background(), "regex-test")
+
+	cases := []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+		wantUpHit  bool
+	}{
+		{"PUT REC-1234 reaches upstream", "PUT", "/upstream/v1/records/REC-1234", http.StatusOK, true},
+		{"PUT BACK-1234 denied at gateway", "PUT", "/upstream/v1/records/BACK-1234", http.StatusForbidden, false},
+		{"GET REC-9 reaches upstream", "GET", "/upstream/v1/records/REC-9", http.StatusOK, true},
+		{"GET BACK-9 denied at gateway", "GET", "/upstream/v1/records/BACK-9", http.StatusForbidden, false},
+		{"POST REC-1/comment reaches upstream", "POST", "/upstream/v1/records/REC-1/comment", http.StatusOK, true},
+		{"DELETE REC-1 denied (no rule matches verb)", "DELETE", "/upstream/v1/records/REC-1", http.StatusForbidden, false},
+		{"GET myself reaches upstream (glob rule)", "GET", "/upstream/v1/myself", http.StatusOK, true},
+		{"GET unrelated denied", "GET", "/upstream/v1/project", http.StatusForbidden, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := hits.Load()
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req.WithContext(ctx))
+			assert.Equal(t, tc.wantStatus, rec.Code)
+			gotUpHit := hits.Load() > before
+			assert.Equal(t, tc.wantUpHit, gotUpHit, "upstream hit expectation")
+		})
+	}
+}
+
+// =============================================================================
+// v0.2.0 regression: redaction must fail closed, never silently pass through
+// =============================================================================
+
+// redactAuth injects nothing but declares a credential to redact, which is what
+// activates the response-redaction path.
+type redactAuth struct{ secret string }
+
+func (a *redactAuth) AddAuth(_ context.Context, _ *http.Request) ([]string, error) {
+	return []string{a.secret}, nil
+}
+
+func newRedactRouter(t *testing.T, upstream *httptest.Server, provider auth.AuthProvider) *Router {
+	t.Helper()
+	upstreamURL, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	access, _ := NewAccessPolicy([]AccessRuleInput{
+		{Action: "ALLOW", Method: "ALL", Path: "/**"},
+	}, false)
+	logger := airlocklog.NewLogger(devNull{}, "integration", "test-agent")
+	router := NewRouter(RouterConfig{AgentID: "test-agent", Logger: logger})
+	router.AddRoute(&Route{
+		PathPrefix:  "/u",
+		StripPrefix: "/u",
+		Upstream:    upstreamURL,
+		Auth:        provider,
+		Access:      access,
+	})
+	return router
+}
+
+// The redactor is an exact-string matcher over plaintext. If the body arrives
+// still compressed it finds nothing and the credential reaches the agent, which
+// can simply decompress it. That must be an error, not a silent pass-through.
+func TestIntegration_RedactionFailsClosedOnEncodedResponse(t *testing.T) {
+	const secret = "super-secret-token-value"
+
+	// gzip is deliberately absent: because the Range/Accept-Encoding strip above
+	// guarantees the Go transport negotiates gzip itself, gzip is always
+	// transparently decoded and its Content-Encoding removed before we see it.
+	// The residual risk is an encoding the transport never decodes.
+	for _, enc := range []string{"br", "zstd", "deflate"} {
+		t.Run(enc, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Claim an encoding the Go transport will not have decoded.
+				w.Header().Set("Content-Encoding", enc)
+				_, _ = w.Write([]byte("leading " + secret + " trailing"))
+			}))
+			defer upstream.Close()
+
+			router := newRedactRouter(t, upstream, &redactAuth{secret: secret})
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/u/thing", nil)
+			router.ServeHTTP(rec, req.WithContext(airlocklog.WithCorrelationID(context.Background(), "test")))
+
+			assert.NotEqual(t, http.StatusOK, rec.Code,
+				"an undecoded body must not be forwarded while redaction is active")
+			assert.NotContains(t, rec.Body.String(), secret,
+				"credential must never reach the agent")
+		})
+	}
+}
+
+// A genuinely gzipped upstream is decoded by the transport, so redaction sees
+// plaintext and the credential is scrubbed — the case the strip is designed to
+// guarantee.
+func TestIntegration_RedactionHandlesRealGzip(t *testing.T) {
+	const secret = "super-secret-token-value"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		_, _ = gz.Write([]byte("leading " + secret + " trailing"))
+		_ = gz.Close()
+	}))
+	defer upstream.Close()
+
+	router := newRedactRouter(t, upstream, &redactAuth{secret: secret})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/u/thing", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	router.ServeHTTP(rec, req.WithContext(airlocklog.WithCorrelationID(context.Background(), "test")))
+
+	assert.Equal(t, http.StatusOK, rec.Code, "real gzip must proxy successfully")
+	assert.NotContains(t, rec.Body.String(), secret, "credential must be redacted from the decoded body")
+	assert.Contains(t, rec.Body.String(), "leading", "non-secret content must survive")
+}
+
+// identity is a decoded body and must proxy normally, with redaction applied.
+func TestIntegration_RedactionAllowsIdentityEncoding(t *testing.T) {
+	const secret = "super-secret-token-value"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "identity")
+		_, _ = w.Write([]byte("leading " + secret + " trailing"))
+	}))
+	defer upstream.Close()
+
+	router := newRedactRouter(t, upstream, &redactAuth{secret: secret})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/u/thing", nil)
+	router.ServeHTTP(rec, req.WithContext(airlocklog.WithCorrelationID(context.Background(), "test")))
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.NotContains(t, rec.Body.String(), secret, "credential must be redacted")
+	assert.Contains(t, rec.Body.String(), "leading", "non-secret content must survive")
+}
+
+// Range/If-Range both suppress the transport's automatic gzip handling and let
+// an agent reassemble a credential from fragments. They must be dropped while
+// redaction is active — and left alone when it is not.
+func TestIntegration_RedactionStripsRangeHeaders(t *testing.T) {
+	seen := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	t.Run("stripped when redacting", func(t *testing.T) {
+		router := newRedactRouter(t, upstream, &redactAuth{secret: "s3cr3t"})
+		req := httptest.NewRequest("GET", "/u/thing", nil)
+		req.Header.Set("Range", "bytes=0-0")
+		req.Header.Set("If-Range", `"etag"`)
+		req.Header.Set("Accept-Encoding", "gzip, br")
+		router.ServeHTTP(httptest.NewRecorder(), req.WithContext(airlocklog.WithCorrelationID(context.Background(), "test")))
+
+		got := <-seen
+		assert.Empty(t, got.Get("Range"), "Range must be dropped while redacting")
+		assert.Empty(t, got.Get("If-Range"), "If-Range must be dropped while redacting")
+		assert.NotContains(t, got.Get("Accept-Encoding"), "br", "agent Accept-Encoding must not survive")
+	})
+
+	t.Run("preserved when not redacting", func(t *testing.T) {
+		router := newRedactRouter(t, upstream, &noopAuth{})
+		req := httptest.NewRequest("GET", "/u/thing", nil)
+		req.Header.Set("Range", "bytes=0-99")
+		router.ServeHTTP(httptest.NewRecorder(), req.WithContext(airlocklog.WithCorrelationID(context.Background(), "test")))
+
+		got := <-seen
+		assert.Equal(t, "bytes=0-99", got.Get("Range"),
+			"a route without redaction must not lose Range")
+	})
+}
+
+// =============================================================================
+// v0.2.0: auth.type "none" behaves like every other route at the router level
+// =============================================================================
+
+func TestIntegration_NoneAuthRouteStripsAgentAuthAndEnforcesAllowlist(t *testing.T) {
+	seen := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		_, _ = w.Write([]byte("media-bytes"))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	access, err := NewAccessPolicy([]AccessRuleInput{
+		{Action: "ALLOW", Method: "GET", Path: "/file/*/binary"},
+		{Action: "DENY", Method: "ALL", Path: "/**"},
+	}, false)
+	require.NoError(t, err)
+
+	logger := airlocklog.NewLogger(devNull{}, "integration", "test-agent")
+	router := NewRouter(RouterConfig{AgentID: "test-agent", Logger: logger})
+	router.AddRoute(&Route{
+		PathPrefix:     "/media",
+		StripPrefix:    "/media",
+		Upstream:       upstreamURL,
+		Auth:           auth.NewNoneAuth(),
+		Access:         access,
+		StripAgentAuth: true,
+	})
+	ctx := airlocklog.WithCorrelationID(context.Background(), "test")
+
+	// Allowlisted path proxies, and the agent's own Authorization is stripped.
+	req := httptest.NewRequest("GET", "/media/file/abc/binary", nil)
+	req.Header.Set("Authorization", "Bearer agent-supplied-token")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req.WithContext(ctx))
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "media-bytes", rec.Body.String())
+
+	got := <-seen
+	assert.Empty(t, got.Get("Authorization"),
+		"strip_agent_auth must drop the agent credential on a none route")
+
+	// The allowlist still fires on a none route.
+	req2 := httptest.NewRequest("DELETE", "/media/file/abc/binary", nil)
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2.WithContext(ctx))
+	assert.Equal(t, http.StatusForbidden, rec2.Code, "none route must still enforce access rules")
 }

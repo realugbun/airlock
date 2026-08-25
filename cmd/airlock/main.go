@@ -179,7 +179,7 @@ func buildRoutes(cfg *config.Config, registry *secrets.Registry, logger *slog.Lo
 
 		ruleInputs := make([]proxy.AccessRuleInput, len(routeCfg.AccessRules))
 		for j, r := range routeCfg.AccessRules {
-			ruleInputs[j] = proxy.AccessRuleInput{Action: r.Action, Method: r.Method, Path: r.Path}
+			ruleInputs[j] = proxy.AccessRuleInput{Action: r.Action, Method: r.Method, Path: r.Path, PathRegex: r.PathRegex}
 		}
 		// Explicit empty access_rules: [] means deny all; omitted means allow all.
 		denyAll := routeCfg.AccessRules != nil && len(routeCfg.AccessRules) == 0
@@ -303,6 +303,8 @@ func buildAuthProvider(registry *secrets.Registry, routeCfg config.RouteConfig) 
 			Header:       routeCfg.Auth.Header,
 			Prefix:       routeCfg.Auth.Prefix,
 		})
+	case "none":
+		return auth.NewNoneAuth()
 	default:
 		return nil
 	}
