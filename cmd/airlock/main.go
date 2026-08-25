@@ -303,6 +303,8 @@ func buildAuthProvider(registry *secrets.Registry, routeCfg config.RouteConfig) 
 			Header:       routeCfg.Auth.Header,
 			Prefix:       routeCfg.Auth.Prefix,
 		})
+	case "none":
+		return auth.NewNoneAuth()
 	default:
 		return nil
 	}

@@ -190,10 +190,23 @@ func (c *Config) validate() error {
 			if r.Auth.TokenURL == "" {
 				return fmt.Errorf("route %d: auth.token_url is required for oauth2 auth", i)
 			}
+		case "none":
+			// Passthrough: no credential is injected. Reject any credential or
+			// header field so a config that *looks* like it authenticates can
+			// never be silently ignored.
+			if r.Auth.Token != nil || r.Auth.ClientID != nil || r.Auth.ClientSecret != nil || r.Auth.RefreshToken != nil {
+				return fmt.Errorf("route %d: auth.type \"none\" injects no credential, so token/client_id/client_secret/refresh_token must not be set", i)
+			}
+			if r.Auth.TokenURL != "" || r.Auth.Scopes != "" {
+				return fmt.Errorf("route %d: auth.type \"none\" injects no credential, so token_url/scopes must not be set", i)
+			}
+			if r.Auth.Header != "" || r.Auth.Prefix != "" {
+				return fmt.Errorf("route %d: auth.type \"none\" injects no credential, so auth.header/auth.prefix must not be set", i)
+			}
 		default:
 			return fmt.Errorf("route %d: unknown auth type %q", i, r.Auth.Type)
 		}
-		if r.Auth.Header == "" {
+		if r.Auth.Type != "none" && r.Auth.Header == "" {
 			return fmt.Errorf("route %d: auth.header is required", i)
 		}
 		if r.MCPRules != nil && len(r.MCPRules.AllowedTools) > 0 && len(r.MCPRules.DeniedTools) > 0 {
