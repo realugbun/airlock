@@ -163,6 +163,11 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 		baseTransport = &stripForwardingTransport{base: baseTransport}
 	}
 	route.proxy = &httputil.ReverseProxy{
+		// Director is deprecated in favour of Rewrite as of Go 1.26. Migrating is
+		// not a drop-in change: Rewrite does not populate X-Forwarded-For the way
+		// Director does, which interacts directly with the strip_forwarding_headers
+		// route option, so it needs its own change with dedicated tests.
+		//nolint:staticcheck // SA1019: Director -> Rewrite migration handled separately
 		Director: func(req *http.Request) {
 			req.URL.Scheme = upstream.Scheme
 			req.URL.Host = upstream.Host
