@@ -74,6 +74,14 @@ func (p *AccessPolicy) Allowed(method, path string) bool {
 	if len(p.rules) == 0 {
 		return true
 	}
+	// Enforce the segment cap once, for the whole request. matchSegments caps
+	// only the rules it evaluates, so without this an overlong path fails every
+	// glob rule (including a trailing DENY /**) and can then be caught by a
+	// later ALLOW path_regex, which has no such cap — a fail-open bypass that
+	// only appears once both matchers coexist.
+	if len(splitPath(path)) > maxPathSegments {
+		return false
+	}
 	normalized := normalizePath(path)
 	for _, r := range p.rules {
 		if r.method != "ALL" && r.method != method {
@@ -126,7 +134,15 @@ func parseRuleInput(input AccessRuleInput) (accessRule, error) {
 		if len(input.PathRegex) > MaxPathRegexLen {
 			return accessRule{}, fmt.Errorf("path_regex exceeds %d characters", MaxPathRegexLen)
 		}
-		// Always wrap as \A(?:user)\z so the user pattern is fully anchored
+		// Reject patterns that are not valid regexes on their own BEFORE
+		// wrapping. An unbalanced ")" would otherwise re-parenthesise the
+		// wrapper and silently defeat the anchoring: "/v1/ok)|(.*" compiles as
+		// \A(?:/v1/ok)|(.*)\z, whose second alternative is unanchored and
+		// matches every path — turning an ALLOW rule into allow-all.
+		if _, err := regexp.Compile(input.PathRegex); err != nil {
+			return accessRule{}, fmt.Errorf("invalid path_regex %q: %w", input.PathRegex, err)
+		}
+		// Wrap as \A(?:user)\z so the user pattern is fully anchored
 		// regardless of any internal alternations like "foo|bar". User-supplied
 		// ^/$ anchors are harmless inside the non-capturing group.
 		wrapped := `\A(?:` + input.PathRegex + `)\z`

@@ -678,12 +678,14 @@ func TestLoadConfig_AuthNone_Valid(t *testing.T) {
 // at load rather than silently proxying unauthenticated.
 func TestLoadConfig_AuthNone_RejectsCredentialFields(t *testing.T) {
 	cases := map[string]string{
-		"token":     "    auth:\n      type: none\n      token:\n        from: env\n        key: \"SOME_TOKEN\"",
-		"header":    "    auth:\n      type: none\n      header: \"Authorization\"",
-		"prefix":    "    auth:\n      type: none\n      prefix: \"Bearer \"",
-		"token_url": "    auth:\n      type: none\n      token_url: \"https://example.com/token\"",
-		"scopes":    "    auth:\n      type: none\n      scopes: \"read\"",
-		"client_id": "    auth:\n      type: none\n      client_id:\n        from: env\n        key: \"CID\"",
+		"token":         "    auth:\n      type: none\n      token:\n        from: env\n        key: \"SOME_TOKEN\"",
+		"header":        "    auth:\n      type: none\n      header: \"Authorization\"",
+		"prefix":        "    auth:\n      type: none\n      prefix: \"Bearer \"",
+		"token_url":     "    auth:\n      type: none\n      token_url: \"https://example.com/token\"",
+		"scopes":        "    auth:\n      type: none\n      scopes: \"read\"",
+		"client_id":     "    auth:\n      type: none\n      client_id:\n        from: env\n        key: \"CID\"",
+		"client_secret": "    auth:\n      type: none\n      client_secret:\n        from: env\n        key: \"CSEC\"",
+		"refresh_token": "    auth:\n      type: none\n      refresh_token:\n        from: env\n        key: \"RTOK\"",
 	}
 	for name, authBlock := range cases {
 		t.Run(name, func(t *testing.T) {

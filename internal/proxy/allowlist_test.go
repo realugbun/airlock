@@ -475,3 +475,71 @@ func TestNormalizePath(t *testing.T) {
 		assert.Equal(t, tt.want, normalizePath(tt.in), "normalizePath(%q)", tt.in)
 	}
 }
+
+// --- v0.2.0 regression: mixed glob/regex matchers must not fail open ---
+
+// matchSegments caps only the rule it is evaluating, so before the central cap
+// an overlong path failed every glob rule — including a trailing DENY — and
+// then fell through to a later ALLOW path_regex, which has no cap. That is a
+// fail-open bypass that only exists once both matchers coexist.
+func TestAccess_OverlongPathDoesNotBypassDenyGlobViaAllowRegex(t *testing.T) {
+	p, err := NewAccessPolicy([]AccessRuleInput{
+		{Action: "DENY", Method: "ALL", Path: "/admin/**"},
+		{Action: "ALLOW", Method: "ALL", PathRegex: `/.+`},
+	}, false)
+	require.NoError(t, err)
+
+	// Well under the cap: the DENY glob matches and wins.
+	assert.False(t, p.Allowed("GET", "/admin/users"), "short admin path must be denied")
+	// Non-admin short path is allowed by the regex — the rule set is meaningful.
+	assert.True(t, p.Allowed("GET", "/public/thing"), "short non-admin path should be allowed")
+
+	// Over the 256-segment cap: must NOT become allow-all.
+	overlong := "/admin/" + strings.Repeat("x/", maxPathSegments+1)
+	assert.False(t, p.Allowed("GET", overlong), "overlong admin path must not bypass DENY via the ALLOW regex")
+
+	// The cap applies to the whole request, not just admin paths.
+	assert.False(t, p.Allowed("GET", "/public/"+strings.Repeat("y/", maxPathSegments+1)),
+		"any path over the segment cap must be refused")
+}
+
+// An unbalanced ")" re-parenthesises the \A(?:...)\z wrapper: "/v1/ok)|(.*"
+// compiles as \A(?:/v1/ok)|(.*)\z, whose second alternative is unanchored and
+// matches every path — silently turning an ALLOW rule into allow-all.
+func TestAccess_PathRegexRejectsAnchorEscapingPattern(t *testing.T) {
+	for _, pattern := range []string{
+		`/v1/ok)|(.*`,
+		`/v1/ok)\z|\A(?:.*`,
+	} {
+		t.Run(pattern, func(t *testing.T) {
+			_, err := NewAccessPolicy([]AccessRuleInput{
+				{Action: "ALLOW", Method: "GET", PathRegex: pattern},
+			}, false)
+			require.Error(t, err, "anchor-escaping pattern must be rejected at construction")
+			assert.Contains(t, err.Error(), "invalid path_regex")
+		})
+	}
+}
+
+// Guard the fix from over-reaching: legitimate patterns must still build and
+// stay anchored.
+func TestAccess_PathRegexStillAnchorsValidPatterns(t *testing.T) {
+	p, err := NewAccessPolicy([]AccessRuleInput{
+		{Action: "ALLOW", Method: "PUT", PathRegex: `/rest/api/3/issue/AI-\d+`},
+		{Action: "DENY", Method: "ALL", Path: "/**"},
+	}, false)
+	require.NoError(t, err)
+
+	assert.True(t, p.Allowed("PUT", "/rest/api/3/issue/AI-283"))
+	assert.False(t, p.Allowed("PUT", "/rest/api/3/issue/BACK-1"), "other projects must not match")
+	assert.False(t, p.Allowed("PUT", "/x/rest/api/3/issue/AI-1"), "prefix must not match (anchored)")
+	assert.False(t, p.Allowed("PUT", "/rest/api/3/issue/AI-1/extra"), "suffix must not match (anchored)")
+	// Internal alternation must not escape the wrapper.
+	p2, err := NewAccessPolicy([]AccessRuleInput{
+		{Action: "ALLOW", Method: "GET", PathRegex: `/a|/b`},
+	}, false)
+	require.NoError(t, err)
+	assert.True(t, p2.Allowed("GET", "/a"))
+	assert.True(t, p2.Allowed("GET", "/b"))
+	assert.False(t, p2.Allowed("GET", "/a/c"), "alternation must remain fully anchored")
+}
