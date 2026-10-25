@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -767,5 +768,97 @@ routes:
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "hop-by-hop")
 		})
+	}
+}
+
+const strictBaseConfig = `
+service: test-svc
+telemetry:
+  endpoint: ""
+providers:
+  env: {}
+routes:
+  - path_prefix: /mcp
+    upstream: http://127.0.0.1:9999
+    auth:
+      type: static
+      token: {from: env, key: KEY}
+      header: Authorization
+    rate_limit: {rps: 1, burst: 1}
+    access_rules:
+      - {action: ALLOW, method: POST, path: /}
+    mcp_rules:
+      allowed_tools: [safe_read]
+`
+
+func loadString(t *testing.T, content string) (*Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	return Load(path)
+}
+
+func TestLoadConfig_StrictBaseIsValid(t *testing.T) {
+	_, err := loadString(t, strictBaseConfig)
+	require.NoError(t, err)
+}
+
+func TestLoadConfig_UnknownFieldsRejectedAtEveryLevel(t *testing.T) {
+	cases := map[string][2]string{
+		"top level":    {"service: test-svc", "service: test-svc\nservce: typo"},
+		"telemetry":    {`endpoint: ""`, "endpoint: \"\"\n  endpont: typo"},
+		"providers":    {"env: {}", "env: {}\n  vualt: {}"},
+		"route":        {"upstream: http://127.0.0.1:9999", "upstream: http://127.0.0.1:9999\n    strip_prefx: /mcp"},
+		"auth":         {"header: Authorization", "header: Authorization\n      prefx: x"},
+		"secret ref":   {"token: {from: env, key: KEY}", "token: {from: env, key: KEY, kye: x}"},
+		"rate limit":   {"rate_limit: {rps: 1, burst: 1}", "rate_limit: {rps: 1, brust: 1}"},
+		"access rule":  {"{action: ALLOW, method: POST, path: /}", "{action: ALLOW, method: POST, pth: /}"},
+		"mcp rules":    {"allowed_tools: [safe_read]", "allowed_tool: [safe_read]"},
+		"denied typo":  {"allowed_tools: [safe_read]", "allowed_tools: [safe_read]\n      denied_tool: [x]"},
+		"strip header": {"upstream: http://127.0.0.1:9999", "upstream: http://127.0.0.1:9999\n    strip_forwarding_header: true"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			content := strings.Replace(strictBaseConfig, c[0], c[1], 1)
+			require.NotEqual(t, strictBaseConfig, content)
+			_, err := loadString(t, content)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "not found")
+		})
+	}
+}
+
+func TestLoadConfig_TrailingDocuments(t *testing.T) {
+	_, err := loadString(t, strictBaseConfig+"---\nservice: other\n")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "single YAML document")
+
+	_, err = loadString(t, strictBaseConfig+"---\n")
+	require.NoError(t, err, "a trailing empty document is harmless")
+
+	_, err = loadString(t, strictBaseConfig+"...\n")
+	require.NoError(t, err)
+}
+
+func TestLoadConfig_EmptyAllowedToolsRejected(t *testing.T) {
+	for name, repl := range map[string]string{
+		"empty list": "allowed_tools: []",
+		"null":       "allowed_tools:",
+		"tilde":      "allowed_tools: ~",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := loadString(t, strings.Replace(strictBaseConfig, "allowed_tools: [safe_read]", repl, 1))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "allowed_tools is empty")
+		})
+	}
+
+	// mcp_rules: {} stays the explicit pass-through form, and an empty
+	// denylist denies nothing.
+	for _, repl := range []string{"{}", "\n      denied_tools: []"} {
+		content := strings.Replace(strictBaseConfig, "\n      allowed_tools: [safe_read]", "", 1)
+		content = strings.Replace(content, "mcp_rules:", "mcp_rules: "+strings.TrimPrefix(repl, " "), 1)
+		_, err := loadString(t, content)
+		require.NoError(t, err, repl)
 	}
 }
