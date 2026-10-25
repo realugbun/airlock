@@ -40,6 +40,16 @@ This document covers Airlock's security model, threat model, path normalization,
 - [ ] Review MCP rules: use `allowed_tools` for strict control, check logs for `MCP tools discovered`
 - [ ] One Airlock per agent — the sidecar model is the default security boundary
 
+## MCP Request Inspection
+
+On a route whose `mcp_rules` lists `allowed_tools` or `denied_tools`, a POST body that Airlock cannot inspect exactly as the upstream will read it is rejected, never forwarded:
+
+- `413` if the body exceeds 10 MiB (by `Content-Length` or after reading a chunked body)
+- `415` for a `Content-Encoding` other than `identity`, or a `Content-Type` that is not `application/json` or `text/json` (compared case-insensitively; a `charset` must be UTF-8). A missing `Content-Type` is inspected as JSON
+- `400` for malformed JSON, invalid UTF-8, a `tools/call` without a non-empty string `params.name`, a batch with any invalid element, or a duplicate or case-variant `method`, `params` or `name` key (`"Name"`, `"METHOD"`). JSON parsers disagree on which duplicate wins and whether keys are case-sensitive, so these are ambiguous
+
+`mcp_rules: {}` enforces nothing and keeps forwarding such requests unchanged.
+
 ## Path Normalization
 
 Airlock matches against `r.URL.Path` (the percent-decoded request path) after `strip_prefix` is applied. Matching is **segment-based** — paths are split on `/` and compared segment by segment.

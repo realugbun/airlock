@@ -189,7 +189,7 @@ func TestMCP_NonPostMethod_Passthrough(t *testing.T) {
 	assert.False(t, result.Denied)
 }
 
-func TestMCP_NonJSONContentType_Passthrough(t *testing.T) {
+func TestMCP_NonJSONContentType_Rejected(t *testing.T) {
 	p, _ := NewMCPToolPolicy(&MCPToolPolicyConfig{
 		AllowedTools: []string{"get_events"},
 	})
@@ -197,9 +197,16 @@ func TestMCP_NonJSONContentType_Passthrough(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString("not json"))
 	req.Header.Set("Content-Type", "text/plain")
 
-	result, err := p.CheckRequest(req)
-	require.NoError(t, err)
-	assert.False(t, result.Denied)
+	_, err := p.CheckRequest(req)
+	requireMCPReject(t, err, http.StatusUnsupportedMediaType)
+}
+
+// requireMCPReject asserts that err is an *MCPRequestError with the given status.
+func requireMCPReject(t *testing.T, err error, status int) {
+	t.Helper()
+	var reqErr *MCPRequestError
+	require.ErrorAs(t, err, &reqErr)
+	assert.Equal(t, status, reqErr.Status, reqErr.Reason)
 }
 
 func TestMCP_EmptyBody_Passthrough(t *testing.T) {
@@ -215,7 +222,7 @@ func TestMCP_EmptyBody_Passthrough(t *testing.T) {
 	assert.False(t, result.Denied)
 }
 
-func TestMCP_MalformedJSON_Passthrough(t *testing.T) {
+func TestMCP_MalformedJSON_Rejected(t *testing.T) {
 	p, _ := NewMCPToolPolicy(&MCPToolPolicyConfig{
 		AllowedTools: []string{"get_events"},
 	})
@@ -223,12 +230,11 @@ func TestMCP_MalformedJSON_Passthrough(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString("{invalid json"))
 	req.Header.Set("Content-Type", "application/json")
 
-	result, err := p.CheckRequest(req)
-	require.NoError(t, err)
-	assert.False(t, result.Denied)
+	_, err := p.CheckRequest(req)
+	requireMCPReject(t, err, http.StatusBadRequest)
 }
 
-func TestMCP_MissingParams_Passthrough(t *testing.T) {
+func TestMCP_MissingParams_Rejected(t *testing.T) {
 	p, _ := NewMCPToolPolicy(&MCPToolPolicyConfig{
 		AllowedTools: []string{"get_events"},
 	})
@@ -237,9 +243,8 @@ func TestMCP_MissingParams_Passthrough(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 
-	result, err := p.CheckRequest(req)
-	require.NoError(t, err)
-	assert.False(t, result.Denied)
+	_, err := p.CheckRequest(req)
+	requireMCPReject(t, err, http.StatusBadRequest)
 }
 
 func TestMCP_BodyReattached(t *testing.T) {

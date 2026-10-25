@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -421,15 +422,7 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 	if route.MCPRules != nil {
 		mcpResult, mcpErr := route.MCPRules.CheckRequest(r)
 		if mcpErr != nil {
-			if rl != nil {
-				rl.Message = "MCP body inspection failed"
-			}
-			rt.logger.Error("MCP body inspection failed",
-				"correlation_id", correlationID,
-				"route", route.PathPrefix,
-				"error", mcpErr.Error(),
-			)
-			http.Error(w, "Bad Request", http.StatusBadRequest)
+			rt.rejectMCPRequest(ctx, w, rl, span, route, correlationID, mcpErr)
 			return
 		}
 		// Store MCP info in context for ModifyResponse to use.
@@ -542,4 +535,33 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 		))
 
 	route.proxy.ServeHTTP(w, r)
+}
+
+// rejectMCPRequest writes the response for a request whose MCP body could not
+// be inspected. Policy rejections carry their own status; anything else is a
+// failure to read the request body.
+func (rt *Router) rejectMCPRequest(ctx context.Context, w http.ResponseWriter, rl *middleware.RequestLog, span trace.Span, route *Route, correlationID string, err error) {
+	status := http.StatusBadRequest
+	msg := "Bad Request: could not read request body"
+	var reqErr *MCPRequestError
+	if errors.As(err, &reqErr) {
+		status = reqErr.Status
+		msg = http.StatusText(status) + ": " + reqErr.Reason
+	}
+	if rl != nil {
+		rl.Message = "MCP request rejected"
+	}
+	span.SetAttributes(attribute.String("status", "mcp_rejected"))
+	rt.requestCounter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("route", route.PathPrefix),
+			attribute.String("status", "mcp_rejected"),
+		))
+	rt.logger.Warn("MCP request rejected",
+		"correlation_id", correlationID,
+		"route", route.PathPrefix,
+		"status", status,
+		"error", err.Error(),
+	)
+	http.Error(w, msg, status)
 }
