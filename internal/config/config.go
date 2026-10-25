@@ -1,8 +1,13 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	"net/textproto"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/realugbun/airlock/pkg/secrets"
@@ -145,16 +150,87 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("reading config file: %w", err)
 	}
 
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	cfg, err := decodeStrict(data)
+	if err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 
+	if err := checkEmptyAllowlists(data, cfg); err != nil {
+		return nil, fmt.Errorf("validating config: %w", err)
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("validating config: %w", err)
 	}
 
-	return &cfg, nil
+	return cfg, nil
+}
+
+// decodeStrict decodes a single YAML document, rejecting unknown fields so
+// that a typo such as "allowed_tool" fails instead of being ignored.
+// Trailing empty documents (a final "---") are allowed; anything else after
+// the first document is an error.
+func decodeStrict(data []byte) (*Config, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+
+	var cfg Config
+	if err := dec.Decode(&cfg); err != nil {
+		if errors.Is(err, io.EOF) {
+			return &cfg, nil
+		}
+		return nil, err
+	}
+	for {
+		var extra yaml.Node
+		err := dec.Decode(&extra)
+		if errors.Is(err, io.EOF) {
+			return &cfg, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !isEmptyDocument(&extra) {
+			return nil, fmt.Errorf("config must be a single YAML document, found another at line %d", extra.Line)
+		}
+	}
+}
+
+func isEmptyDocument(n *yaml.Node) bool {
+	if n.Kind != yaml.DocumentNode {
+		return n.Kind == 0
+	}
+	for _, c := range n.Content {
+		if c.Kind != yaml.ScalarNode || c.ShortTag() != "!!null" {
+			return false
+		}
+	}
+	return true
+}
+
+// checkEmptyAllowlists rejects an allowed_tools key that is present but
+// empty. An empty allowlist builds a pass-through policy, the opposite of
+// what an operator writing allowed_tools intends. Use mcp_rules: {} for
+// pass-through.
+func checkEmptyAllowlists(data []byte, cfg *Config) error {
+	var presence struct {
+		Routes []struct {
+			MCPRules *struct {
+				AllowedTools yaml.Node `yaml:"allowed_tools"`
+			} `yaml:"mcp_rules"`
+		} `yaml:"routes"`
+	}
+	if err := yaml.Unmarshal(data, &presence); err != nil {
+		return err
+	}
+	for i, r := range presence.Routes {
+		if r.MCPRules == nil || r.MCPRules.AllowedTools.Kind == 0 || i >= len(cfg.Routes) {
+			continue
+		}
+		if m := cfg.Routes[i].MCPRules; m == nil || len(m.AllowedTools) == 0 {
+			return fmt.Errorf("route %d (%s): mcp_rules.allowed_tools is empty, which would allow every tool; list the allowed tools, or use mcp_rules: {} for no filtering", i, cfg.Routes[i].PathPrefix)
+		}
+	}
+	return nil
 }
 
 func (c *Config) validate() error {
@@ -209,6 +285,14 @@ func (c *Config) validate() error {
 		if r.Auth.Type != "none" && r.Auth.Header == "" {
 			return fmt.Errorf("route %d: auth.header is required", i)
 		}
+		if r.Auth.Header != "" && isHopByHopHeader(r.Auth.Header) {
+			return fmt.Errorf("route %d: auth.header %q is a hop-by-hop header and would not reach the upstream", i, r.Auth.Header)
+		}
+		for name := range r.ExtraHeaders {
+			if isHopByHopHeader(name) {
+				return fmt.Errorf("route %d: extra_headers %q is a hop-by-hop header and would not reach the upstream", i, name)
+			}
+		}
 		if r.MCPRules != nil && len(r.MCPRules.AllowedTools) > 0 && len(r.MCPRules.DeniedTools) > 0 {
 			return fmt.Errorf("route %d: mcp_rules cannot have both allowed_tools and denied_tools", i)
 		}
@@ -231,4 +315,15 @@ func (c *Config) validate() error {
 	}
 
 	return nil
+}
+
+// isHopByHopHeader reports whether name is a header that proxies remove
+// before forwarding, so a value injected under that name never arrives.
+func isHopByHopHeader(name string) bool {
+	switch textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(name)) {
+	case "Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
+		"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade":
+		return true
+	}
+	return false
 }

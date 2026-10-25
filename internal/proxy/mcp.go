@@ -7,12 +7,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"path"
 	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 const maxMCPBodySize = 10 * 1024 * 1024 // 10 MB
+
+// maxMCPResponseSize caps a non-streaming tools/list response, which is
+// buffered in full to filter it. Larger responses fail with 502.
+const maxMCPResponseSize = 10 * 1024 * 1024 // 10 MB
 
 // mcpInfoKey stores MCP request metadata in context for ModifyResponse.
 type mcpInfoKey struct{}
@@ -109,7 +116,8 @@ func NewMCPToolPolicy(cfg *MCPToolPolicyConfig) (*MCPToolPolicy, error) {
 	return p, nil
 }
 
-// jsonRPCRequest is the minimal structure needed to inspect MCP requests.
+// jsonRPCRequest is the minimal structure of an MCP request, as decoded by a
+// typical upstream. Request inspection uses parseRPCMessage instead.
 type jsonRPCRequest struct {
 	ID     json.RawMessage `json:"id"`
 	Method string          `json:"method"`
@@ -136,9 +144,27 @@ type MCPCheckResult struct {
 	Method    string // JSON-RPC method (e.g. "tools/call", "tools/list")
 }
 
+// MCPRequestError reports an MCP request that Airlock refuses to forward
+// because it cannot be inspected safely. Status is the HTTP status to return.
+type MCPRequestError struct {
+	Status int
+	Reason string
+}
+
+func (e *MCPRequestError) Error() string { return e.Reason }
+
+func mcpReject(status int, reason string) error {
+	return &MCPRequestError{Status: status, Reason: reason}
+}
+
 // CheckRequest inspects the request body for MCP tool calls and enforces
 // the tool policy. It reads and re-attaches the body so downstream handlers
 // can still consume it.
+//
+// When the policy has tool rules, inspection fails closed: a POST body that
+// cannot be inspected exactly as the upstream will read it is rejected with an
+// *MCPRequestError (400, 413 or 415) instead of being forwarded. Other errors
+// are failures to read the request body.
 //
 // Non-tool MCP methods (initialize, tools/list, ping, etc.) always pass through.
 func (p *MCPToolPolicy) CheckRequest(r *http.Request) (*MCPCheckResult, error) {
@@ -151,93 +177,278 @@ func (p *MCPToolPolicy) CheckRequest(r *http.Request) (*MCPCheckResult, error) {
 		return &MCPCheckResult{}, nil
 	}
 
-	// Only inspect JSON content.
-	ct := r.Header.Get("Content-Type")
-	if ct != "" && !isJSONContentType(ct) {
-		return &MCPCheckResult{}, nil
+	if !p.hasToolRules() {
+		return p.observeRequest(r)
+	}
+	return p.enforceRequest(r)
+}
+
+// enforceRequest inspects a POST on a route with tool rules. Anything that
+// could be read differently by the upstream is rejected.
+func (p *MCPToolPolicy) enforceRequest(r *http.Request) (*MCPCheckResult, error) {
+	// A compressed body would be inspected as opaque bytes while the upstream
+	// may decompress it and run the call.
+	for _, enc := range r.Header.Values("Content-Encoding") {
+		for _, tok := range strings.Split(enc, ",") {
+			if t := strings.TrimSpace(tok); t != "" && !strings.EqualFold(t, "identity") {
+				return nil, mcpReject(http.StatusUnsupportedMediaType, "Content-Encoding not supported on MCP requests")
+			}
+		}
 	}
 
-	// Read the body up to the size limit + 1 byte so we can detect oversized
-	// requests without buffering arbitrarily large payloads into memory.
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxMCPBodySize+1))
-	_ = r.Body.Close()
+	// An empty Content-Type is inspected as JSON. Anything else must parse
+	// as a JSON media type.
+	cts := r.Header.Values("Content-Type")
+	if len(cts) > 1 {
+		return nil, mcpReject(http.StatusBadRequest, "multiple Content-Type headers")
+	}
+	if len(cts) == 1 && !isJSONContentType(cts[0]) {
+		return nil, mcpReject(http.StatusUnsupportedMediaType, "MCP requests must be application/json")
+	}
+
+	if r.ContentLength > maxMCPBodySize {
+		return nil, mcpReject(http.StatusRequestEntityTooLarge, "MCP request body too large")
+	}
+
+	body, err := readBodyContext(r.Context(), r.Body, maxMCPBodySize+1)
 	if err != nil {
 		return nil, fmt.Errorf("reading request body: %w", err)
+	}
+	_ = r.Body.Close()
+	if len(body) > maxMCPBodySize {
+		return nil, mcpReject(http.StatusRequestEntityTooLarge, "MCP request body too large")
 	}
 
 	// Re-attach body for downstream consumption.
 	r.Body = io.NopCloser(bytes.NewReader(body))
 
-	// Skip inspection for oversized bodies.
-	if len(body) > maxMCPBodySize {
-		return &MCPCheckResult{}, nil
-	}
-
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
+		// Nothing to execute; the upstream rejects it.
 		return &MCPCheckResult{}, nil
 	}
+	if !utf8.Valid(trimmed) {
+		return nil, mcpReject(http.StatusBadRequest, "MCP request body is not valid UTF-8")
+	}
 
-	// Batch request (JSON array).
+	var (
+		result *MCPCheckResult
+		reason string
+	)
 	if trimmed[0] == '[' {
-		return p.checkBatch(trimmed)
+		result, reason = p.checkBatch(trimmed)
+	} else {
+		result, reason = p.checkSingle(trimmed)
 	}
-
-	// Single request.
-	return p.checkSingle(trimmed)
-}
-
-func (p *MCPToolPolicy) checkSingle(body []byte) (*MCPCheckResult, error) {
-	var req jsonRPCRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		// Malformed JSON — let upstream handle the error.
-		return &MCPCheckResult{}, nil
-	}
-
-	result := &MCPCheckResult{Method: req.Method}
-
-	// Only filter tools/call. All other methods pass through.
-	if req.Method != "tools/call" {
-		return result, nil
-	}
-
-	// tools/call without params or name — pass through, upstream will error.
-	if req.Params == nil || req.Params.Name == "" {
-		return result, nil
-	}
-
-	if p.isToolDenied(req.Params.Name) {
-		result.Denied = true
-		result.ToolName = req.Params.Name
-		result.RequestID = req.ID
+	if reason != "" {
+		return nil, mcpReject(http.StatusBadRequest, reason)
 	}
 	return result, nil
 }
 
-func (p *MCPToolPolicy) checkBatch(body []byte) (*MCPCheckResult, error) {
-	var batch []jsonRPCRequest
-	if err := json.Unmarshal(body, &batch); err != nil {
-		// Malformed batch — let upstream handle it.
+// observeRequest handles a pass-through policy (mcp_rules: {}). Nothing is
+// enforced; the method is recorded so tools/list responses can be logged.
+// The body is never truncated.
+func (p *MCPToolPolicy) observeRequest(r *http.Request) (*MCPCheckResult, error) {
+	if ct := r.Header.Get("Content-Type"); ct != "" && !isJSONContentType(ct) {
 		return &MCPCheckResult{}, nil
 	}
 
-	for _, req := range batch {
-		if req.Method != "tools/call" {
-			continue
+	body, err := readBodyContext(r.Context(), r.Body, maxMCPBodySize+1)
+	if err != nil {
+		return nil, fmt.Errorf("reading request body: %w", err)
+	}
+	if len(body) > maxMCPBodySize {
+		// Forward the whole body uninspected.
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(body), r.Body), r.Body}
+		return &MCPCheckResult{}, nil
+	}
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] == '[' {
+		return &MCPCheckResult{}, nil
+	}
+	msg, reason := parseRPCMessage(trimmed)
+	if reason != "" {
+		return &MCPCheckResult{}, nil
+	}
+	return &MCPCheckResult{Method: msg.method}, nil
+}
+
+// readBodyContext reads up to limit bytes from body, returning early with the
+// context error if ctx ends first. The abandoned read finishes in the
+// background once the connection read deadline fires or the client sends.
+//
+// Once ctx's deadline has passed, any failure is reported as
+// context.DeadlineExceeded. The connection read deadline is set to the same
+// instant, and when it fires first net/http cancels the connection context,
+// so ctx can end with context.Canceled and the read with some other error,
+// depending on which goroutine wins.
+func readBodyContext(ctx context.Context, body io.Reader, limit int64) ([]byte, error) {
+	if ctx.Done() == nil {
+		return io.ReadAll(io.LimitReader(body, limit))
+	}
+	type result struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		b, err := io.ReadAll(io.LimitReader(body, limit))
+		ch <- result{b, err}
+	}()
+	var err error
+	select {
+	case res := <-ch:
+		if res.err == nil {
+			return res.b, nil
 		}
-		if req.Params == nil || req.Params.Name == "" {
-			continue
+		err = res.err
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return nil, fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
+	}
+	return nil, err
+}
+
+// rpcMessage is a JSON-RPC message as inspected by Airlock.
+type rpcMessage struct {
+	id       json.RawMessage
+	method   string
+	toolName string // set only for tools/call
+}
+
+// parseRPCMessage parses one JSON-RPC message for policy checks. It returns
+// a non-empty reason if the message is malformed or ambiguous.
+//
+// encoding/json matches object keys case-insensitively and keeps the last
+// duplicate, while most upstream runtimes are case-sensitive. A body such as
+// {"params":{"name":"delete_all","Name":"read"}} would be checked as "read"
+// and executed as "delete_all". Keys that drive the policy decision must
+// therefore appear exactly once, in exact case.
+func parseRPCMessage(raw []byte) (*rpcMessage, string) {
+	fields, reason := decodeStrictObject(raw, "method", "params")
+	if reason != "" {
+		return nil, reason
+	}
+	msg := &rpcMessage{id: fields["id"]}
+
+	methodRaw, ok := fields["method"]
+	if !ok {
+		// A response or other method-less message: nothing to execute.
+		return msg, ""
+	}
+	if err := json.Unmarshal(methodRaw, &msg.method); err != nil {
+		return nil, "JSON-RPC method must be a string"
+	}
+	if msg.method != "tools/call" {
+		return msg, ""
+	}
+
+	paramsRaw, ok := fields["params"]
+	if !ok {
+		return nil, "tools/call requires params"
+	}
+	params, reason := decodeStrictObject(paramsRaw, "name")
+	if reason != "" {
+		return nil, "tools/call params: " + reason
+	}
+	nameRaw, ok := params["name"]
+	if !ok {
+		return nil, "tools/call requires params.name"
+	}
+	if err := json.Unmarshal(nameRaw, &msg.toolName); err != nil || msg.toolName == "" {
+		return nil, "tools/call params.name must be a non-empty string"
+	}
+	return msg, ""
+}
+
+// decodeStrictObject decodes raw as a single JSON object. Each guarded key
+// must not appear more than once or in any other letter case.
+func decodeStrictObject(raw []byte, guarded ...string) (map[string]json.RawMessage, string) {
+	if !json.Valid(raw) {
+		return nil, "malformed JSON"
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return nil, "JSON-RPC message must be an object"
+	}
+	fields := make(map[string]json.RawMessage)
+	seen := make(map[string]bool, len(guarded))
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, "malformed JSON"
 		}
-		if p.isToolDenied(req.Params.Name) {
+		key, _ := tok.(string)
+		for _, g := range guarded {
+			if !strings.EqualFold(key, g) {
+				continue
+			}
+			if key != g {
+				return nil, fmt.Sprintf("key %q must be lowercase %q", key, g)
+			}
+			if seen[g] {
+				return nil, fmt.Sprintf("duplicate key %q", g)
+			}
+			seen[g] = true
+		}
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return nil, "malformed JSON"
+		}
+		fields[key] = v
+	}
+	return fields, ""
+}
+
+func (p *MCPToolPolicy) checkSingle(body []byte) (*MCPCheckResult, string) {
+	msg, reason := parseRPCMessage(body)
+	if reason != "" {
+		return nil, reason
+	}
+	result := &MCPCheckResult{Method: msg.method}
+	if msg.method == "tools/call" && p.isToolDenied(msg.toolName) {
+		result.Denied = true
+		result.ToolName = msg.toolName
+		result.RequestID = msg.id
+	}
+	return result, ""
+}
+
+func (p *MCPToolPolicy) checkBatch(body []byte) (*MCPCheckResult, string) {
+	var batch []json.RawMessage
+	if err := json.Unmarshal(body, &batch); err != nil {
+		return nil, "malformed JSON-RPC batch"
+	}
+
+	msgs := make([]*rpcMessage, 0, len(batch))
+	for i, raw := range batch {
+		msg, reason := parseRPCMessage(raw)
+		if reason != "" {
+			return nil, fmt.Sprintf("batch element %d: %s", i, reason)
+		}
+		msgs = append(msgs, msg)
+	}
+	for _, msg := range msgs {
+		if msg.method == "tools/call" && p.isToolDenied(msg.toolName) {
 			return &MCPCheckResult{
 				Denied:    true,
-				ToolName:  req.Params.Name,
-				RequestID: req.ID,
+				ToolName:  msg.toolName,
+				RequestID: msg.id,
 				Method:    "tools/call",
-			}, nil
+			}, ""
 		}
 	}
-	return &MCPCheckResult{Method: "batch"}, nil
+	return &MCPCheckResult{Method: "batch"}, ""
 }
 
 func (p *MCPToolPolicy) isToolDenied(name string) bool {
@@ -423,9 +634,18 @@ func (p *MCPToolPolicy) filterSSEToolsList(body []byte) (*ToolsFilterResult, err
 	}, nil
 }
 
+// isJSONContentType reports whether ct is a JSON media type. Media types are
+// case-insensitive. A charset parameter, if present, must be UTF-8, since
+// that is how the body is inspected.
 func isJSONContentType(ct string) bool {
-	return strings.HasPrefix(ct, "application/json") ||
-		strings.HasPrefix(ct, "text/json")
+	mt, params, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return false
+	}
+	if cs, ok := params["charset"]; ok && !strings.EqualFold(cs, "utf-8") && !strings.EqualFold(cs, "utf8") {
+		return false
+	}
+	return mt == "application/json" || mt == "text/json"
 }
 
 // WriteJSONRPCError writes a JSON-RPC 2.0 error response.

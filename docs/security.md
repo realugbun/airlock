@@ -8,7 +8,7 @@ This document covers Airlock's security model, threat model, path normalization,
 
 - **Direct credential exposure to the agent.** In the documented deployment model, the agent is not given real upstream API credentials directly. Airlock injects credentials at the network boundary.
 - **Unauthorized API operations.** Firewall-style access rules restrict which HTTP methods and paths the agent can call. MCP tool filtering restricts which JSON-RPC tools the agent can invoke.
-- **Credential leakage in responses.** Airlock redacts injected credentials from proxied response headers and bodies, including SSE streams.
+- **Credential leakage in responses.** Airlock redacts injected credentials from proxied response headers, trailers and bodies, including SSE streams. On routes that inject a credential, upstream 1xx informational responses (such as `103 Early Hints`) are not forwarded.
 - **Uncontrolled blast radius.** Per-route rate limiting and timeouts prevent a single agent from exhausting upstream API quotas or hanging indefinitely.
 
 ### Assumptions
@@ -40,6 +40,26 @@ This document covers Airlock's security model, threat model, path normalization,
 - [ ] Review MCP rules: use `allowed_tools` for strict control, check logs for `MCP tools discovered`
 - [ ] One Airlock per agent — the sidecar model is the default security boundary
 
+## Injected Headers
+
+Before injecting credentials and `extra_headers`, Airlock removes the agent's `Connection` header, every header it names, and the standard hop-by-hop headers. Otherwise `Connection: Authorization` would make the proxy drop the injected credential. `auth.header` and `extra_headers` may not be hop-by-hop names.
+
+## MCP Request Inspection
+
+On a route whose `mcp_rules` lists `allowed_tools` or `denied_tools`, a POST body that Airlock cannot inspect exactly as the upstream will read it is rejected, never forwarded:
+
+- `413` if the body exceeds 10 MiB (by `Content-Length` or after reading a chunked body)
+- `415` for a `Content-Encoding` other than `identity`, or a `Content-Type` that is not `application/json` or `text/json` (compared case-insensitively; a `charset` must be UTF-8). A missing `Content-Type` is inspected as JSON
+- `400` for malformed JSON, invalid UTF-8, a `tools/call` without a non-empty string `params.name`, a batch with any invalid element, or a duplicate or case-variant `method`, `params` or `name` key (`"Name"`, `"METHOD"`). JSON parsers disagree on which duplicate wins and whether keys are case-sensitive, so these are ambiguous
+
+`mcp_rules: {}` enforces nothing and keeps forwarding such requests unchanged.
+
+## Time and Size Limits
+
+- A route's `timeout` starts when the request is routed and covers reading and inspecting the body and resolving secrets. A body not received in time gets `408 Request Timeout`
+- The listener allows 10s to read request headers, 1 MiB of headers, and closes idle keep-alive connections after 120s. There is no server-wide read or write timeout, so SSE streams are bounded only by the route's `timeout` and `idle_timeout`
+- A non-streaming `tools/list` response is buffered to filter it and capped at 10 MiB; a larger response gets `502 Bad Gateway`
+
 ## Path Normalization
 
 Airlock matches against `r.URL.Path` (the percent-decoded request path) after `strip_prefix` is applied. Matching is **segment-based** — paths are split on `/` and compared segment by segment.
@@ -48,7 +68,7 @@ Airlock matches against `r.URL.Path` (the percent-decoded request path) after `s
 
 - **Double slashes** (`//`) are normalized — interior empty segments are filtered, so `/v1//chat/completions` matches the same as `/v1/chat/completions`
 - **Encoded path separators** — requests whose escaped path contains `%2f` or `%5c` are rejected with `400 Bad Request`, preventing "policy sees path A, upstream sees path B" mismatches (checked via `RawPath` with `EscapedPath()` fallback)
-- **Path traversal** — Airlock does not interpret `.`/`..` specially; segments are compared literally. Some upstream proxies or Go's `net/http` may normalize traversal before it reaches Airlock; Airlock's policy does not rely on that
+- **Path traversal** — requests whose decoded path contains a `.` or `..` segment (including `%2e` forms), or a literal backslash, are rejected with `400 Bad Request`, both before and after `strip_prefix` is applied. Airlock never cleans the path, since many upstreams would resolve `/allowed/../admin` to `/admin`
 - **Null bytes** (`%00`) are decoded but treated as literal characters — no truncation
 - **Case-sensitive** — `/V1/CHAT/COMPLETIONS` does not match `/v1/chat/completions`
 - **`*` matches exactly one non-empty segment** — it never matches empty strings

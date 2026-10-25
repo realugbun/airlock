@@ -21,11 +21,13 @@ var eventBoundary = []byte("\n\n")
 type sseEventReader struct {
 	inner     io.ReadCloser
 	transform func([]byte) []byte // applied to each batch of complete events
+	final     func() []byte       // optional; output appended once when the source ends
 	buf       []byte              // accumulated data awaiting \n\n boundary
 	out       []byte              // transformed output ready to deliver
 	readBuf   []byte              // scratch buffer for inner.Read
 	prevCR    bool                // last byte appended was \r (for \r\n normalization)
 	srcDone   bool
+	err       error // terminal error to return once out is drained
 }
 
 // newSSEEventReader creates an sseEventReader that applies transform to each
@@ -45,21 +47,14 @@ func (r *sseEventReader) Read(p []byte) (int, error) {
 		r.out = r.out[n:]
 		return n, nil
 	}
+	if r.err != nil {
+		return 0, r.err
+	}
 
 	for {
 		// If source is done, flush any remaining buffered data.
 		if r.srcDone {
-			if len(r.buf) == 0 {
-				return 0, io.EOF
-			}
-			transformed := r.transform(r.buf)
-			r.buf = nil
-			n := copy(p, transformed)
-			if n < len(transformed) {
-				r.out = make([]byte, len(transformed)-n)
-				copy(r.out, transformed[n:])
-			}
-			return n, io.EOF
+			return r.emit(p, r.drain(), io.EOF)
 		}
 
 		// Read from inner (blocks until data arrives).
@@ -69,17 +64,7 @@ func (r *sseEventReader) Read(p []byte) (int, error) {
 		}
 		if err != nil && err != io.EOF {
 			// Non-EOF error: flush buf and propagate.
-			if len(r.buf) > 0 {
-				transformed := r.transform(r.buf)
-				r.buf = nil
-				n := copy(p, transformed)
-				if n < len(transformed) {
-					r.out = make([]byte, len(transformed)-n)
-					copy(r.out, transformed[n:])
-				}
-				return n, err
-			}
-			return 0, err
+			return r.emit(p, r.drain(), err)
 		}
 		if err == io.EOF {
 			r.srcDone = true
@@ -94,33 +79,53 @@ func (r *sseEventReader) Read(p []byte) (int, error) {
 			r.buf = make([]byte, len(remaining))
 			copy(r.buf, remaining)
 
-			transformed := r.transform(events)
-			n := copy(p, transformed)
-			if n < len(transformed) {
-				r.out = make([]byte, len(transformed)-n)
-				copy(r.out, transformed[n:])
+			if transformed := r.transform(events); len(transformed) > 0 {
+				return r.emit(p, transformed, nil)
 			}
-			return n, nil
+			continue
 		}
 
 		// Safety valve: flush if buffer exceeds limit without \n\n.
 		if len(r.buf) >= sseMaxEventBuf {
 			transformed := r.transform(r.buf)
 			r.buf = nil
-			n := copy(p, transformed)
-			if n < len(transformed) {
-				r.out = make([]byte, len(transformed)-n)
-				copy(r.out, transformed[n:])
+			if len(transformed) > 0 {
+				return r.emit(p, transformed, nil)
 			}
+		}
+		// Otherwise, loop: read more, or flush if the source is done.
+	}
+}
+
+// drain transforms whatever is left in buf and appends the final output.
+func (r *sseEventReader) drain() []byte {
+	var out []byte
+	if len(r.buf) > 0 {
+		out = r.transform(r.buf)
+		r.buf = nil
+	}
+	if r.final != nil {
+		out = append(out, r.final()...)
+		r.final = nil
+	}
+	return out
+}
+
+// emit copies data into p, keeping any remainder in out. A terminal err is
+// returned only once all output has been delivered.
+func (r *sseEventReader) emit(p, data []byte, err error) (int, error) {
+	n := copy(p, data)
+	if n < len(data) {
+		r.out = make([]byte, len(data)-n)
+		copy(r.out, data[n:])
+		if err != nil {
+			r.err = err
 			return n, nil
 		}
-
-		// If source is done but no \n\n found, loop will handle flush.
-		if r.srcDone {
-			continue
-		}
-		// Otherwise, loop to read more from inner.
+	} else if err != nil {
+		r.err = err
 	}
+	return n, err
 }
 
 // appendNormalized appends data to buf, normalizing line endings per the
