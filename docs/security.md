@@ -54,6 +54,12 @@ On a route whose `mcp_rules` lists `allowed_tools` or `denied_tools`, a POST bod
 
 `mcp_rules: {}` enforces nothing and keeps forwarding such requests unchanged.
 
+## Time and Size Limits
+
+- A route's `timeout` starts when the request is routed and covers reading and inspecting the body and resolving secrets. A body not received in time gets `408 Request Timeout`
+- The listener allows 10s to read request headers, 1 MiB of headers, and closes idle keep-alive connections after 120s. There is no server-wide read or write timeout, so SSE streams are bounded only by the route's `timeout` and `idle_timeout`
+- A non-streaming `tools/list` response is buffered to filter it and capped at 10 MiB; a larger response gets `502 Bad Gateway`
+
 ## Path Normalization
 
 Airlock matches against `r.URL.Path` (the percent-decoded request path) after `strip_prefix` is applied. Matching is **segment-based** — paths are split on `/` and compared segment by segment.

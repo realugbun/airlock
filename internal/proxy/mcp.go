@@ -16,6 +16,10 @@ import (
 
 const maxMCPBodySize = 10 * 1024 * 1024 // 10 MB
 
+// maxMCPResponseSize caps a non-streaming tools/list response, which is
+// buffered in full to filter it. Larger responses fail with 502.
+const maxMCPResponseSize = 10 * 1024 * 1024 // 10 MB
+
 // mcpInfoKey stores MCP request metadata in context for ModifyResponse.
 type mcpInfoKey struct{}
 
@@ -205,11 +209,11 @@ func (p *MCPToolPolicy) enforceRequest(r *http.Request) (*MCPCheckResult, error)
 		return nil, mcpReject(http.StatusRequestEntityTooLarge, "MCP request body too large")
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxMCPBodySize+1))
-	_ = r.Body.Close()
+	body, err := readBodyContext(r.Context(), r.Body, maxMCPBodySize+1)
 	if err != nil {
 		return nil, fmt.Errorf("reading request body: %w", err)
 	}
+	_ = r.Body.Close()
 	if len(body) > maxMCPBodySize {
 		return nil, mcpReject(http.StatusRequestEntityTooLarge, "MCP request body too large")
 	}
@@ -249,9 +253,8 @@ func (p *MCPToolPolicy) observeRequest(r *http.Request) (*MCPCheckResult, error)
 		return &MCPCheckResult{}, nil
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxMCPBodySize+1))
+	body, err := readBodyContext(r.Context(), r.Body, maxMCPBodySize+1)
 	if err != nil {
-		_ = r.Body.Close()
 		return nil, fmt.Errorf("reading request body: %w", err)
 	}
 	if len(body) > maxMCPBodySize {
@@ -274,6 +277,30 @@ func (p *MCPToolPolicy) observeRequest(r *http.Request) (*MCPCheckResult, error)
 		return &MCPCheckResult{}, nil
 	}
 	return &MCPCheckResult{Method: msg.method}, nil
+}
+
+// readBodyContext reads up to limit bytes from body, returning early with the
+// context error if ctx ends first. The abandoned read finishes in the
+// background once the connection read deadline fires or the client sends.
+func readBodyContext(ctx context.Context, body io.Reader, limit int64) ([]byte, error) {
+	if ctx.Done() == nil {
+		return io.ReadAll(io.LimitReader(body, limit))
+	}
+	type result struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		b, err := io.ReadAll(io.LimitReader(body, limit))
+		ch <- result{b, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.b, res.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // rpcMessage is a JSON-RPC message as inspected by Airlock.

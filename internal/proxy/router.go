@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/textproto"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -220,27 +221,35 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 					resp.ContentLength = -1
 					resp.Header.Del("Content-Length")
 				} else {
-					// JSON: ReadAll is safe (server closes connection after response).
-					body, readErr := io.ReadAll(resp.Body)
+					// JSON: the whole response is buffered to filter it, so
+					// it is capped. Exceeding the cap is a 502, never a
+					// truncated or unfiltered tool list.
+					if resp.ContentLength > maxMCPResponseSize {
+						_ = resp.Body.Close()
+						return fmt.Errorf("tools/list response of %d bytes exceeds %d byte limit", resp.ContentLength, maxMCPResponseSize)
+					}
+					body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxMCPResponseSize+1))
 					_ = resp.Body.Close()
 					if readErr != nil {
-						resp.Body = io.NopCloser(bytes.NewReader(nil))
+						return fmt.Errorf("reading tools/list response: %w", readErr)
+					}
+					if len(body) > maxMCPResponseSize {
+						return fmt.Errorf("tools/list response exceeds %d byte limit", maxMCPResponseSize)
+					}
+					fr, filterErr := mcpInfo.Policy.FilterToolsListResponse(body, ct)
+					if filterErr == nil && fr.AllTools != nil {
+						logger.Info("MCP tools discovered",
+							"route", routePrefix,
+							"upstream_tools", fr.AllTools,
+							"allowed_tools", fr.AllowedTools,
+							"upstream_count", len(fr.AllTools),
+							"allowed_count", len(fr.AllowedTools),
+						)
+						resp.Body = io.NopCloser(bytes.NewReader(fr.Body))
+						resp.ContentLength = int64(len(fr.Body))
+						resp.Header.Set("Content-Length", strconv.Itoa(len(fr.Body)))
 					} else {
-						fr, filterErr := mcpInfo.Policy.FilterToolsListResponse(body, ct)
-						if filterErr == nil && fr.AllTools != nil {
-							logger.Info("MCP tools discovered",
-								"route", routePrefix,
-								"upstream_tools", fr.AllTools,
-								"allowed_tools", fr.AllowedTools,
-								"upstream_count", len(fr.AllTools),
-								"allowed_count", len(fr.AllowedTools),
-							)
-							resp.Body = io.NopCloser(bytes.NewReader(fr.Body))
-							resp.ContentLength = int64(len(fr.Body))
-							resp.Header.Set("Content-Length", strconv.Itoa(len(fr.Body)))
-						} else {
-							resp.Body = io.NopCloser(bytes.NewReader(body))
-						}
+						resp.Body = io.NopCloser(bytes.NewReader(body))
 					}
 				}
 				mcpFiltered = true
@@ -394,6 +403,19 @@ func (rt *Router) matchRoute(path string) *Route {
 func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	correlationID := airlocklog.CorrelationIDFromContext(ctx)
+
+	// The route timeout covers the whole request, including reading and
+	// inspecting the body and resolving secrets. A context alone does not
+	// interrupt a blocked body read, so also set a read deadline on the
+	// connection where the ResponseWriter supports it.
+	if route.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, route.Timeout)
+		defer cancel()
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = http.NewResponseController(w).SetReadDeadline(deadline)
+		}
+	}
 
 	targetPath := strings.TrimPrefix(r.URL.Path, route.StripPrefix)
 	if targetPath == "" {
@@ -552,12 +574,6 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 		r.Header.Del("If-Range")
 	}
 
-	// Apply request timeouts.
-	if route.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, route.Timeout)
-		defer cancel()
-	}
 	if route.IdleTimeout > 0 {
 		var idleCancel context.CancelFunc
 		ctx, idleCancel = withIdleCancel(ctx)
@@ -591,9 +607,13 @@ func (rt *Router) rejectMCPRequest(ctx context.Context, w http.ResponseWriter, r
 	status := http.StatusBadRequest
 	msg := "Bad Request: could not read request body"
 	var reqErr *MCPRequestError
-	if errors.As(err, &reqErr) {
+	switch {
+	case errors.As(err, &reqErr):
 		status = reqErr.Status
 		msg = http.StatusText(status) + ": " + reqErr.Reason
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded):
+		status = http.StatusRequestTimeout
+		msg = "Request Timeout: request body not received within the route timeout"
 	}
 	if rl != nil {
 		rl.Message = "MCP request rejected"
