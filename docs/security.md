@@ -62,7 +62,7 @@ Airlock matches against `r.URL.Path` (the percent-decoded request path) after `s
 
 - **Double slashes** (`//`) are normalized — interior empty segments are filtered, so `/v1//chat/completions` matches the same as `/v1/chat/completions`
 - **Encoded path separators** — requests whose escaped path contains `%2f` or `%5c` are rejected with `400 Bad Request`, preventing "policy sees path A, upstream sees path B" mismatches (checked via `RawPath` with `EscapedPath()` fallback)
-- **Path traversal** — Airlock does not interpret `.`/`..` specially; segments are compared literally. Some upstream proxies or Go's `net/http` may normalize traversal before it reaches Airlock; Airlock's policy does not rely on that
+- **Path traversal** — requests whose decoded path contains a `.` or `..` segment (including `%2e` forms), or a literal backslash, are rejected with `400 Bad Request`, both before and after `strip_prefix` is applied. Airlock never cleans the path, since many upstreams would resolve `/allowed/../admin` to `/admin`
 - **Null bytes** (`%00`) are decoded but treated as literal characters — no truncation
 - **Case-sensitive** — `/V1/CHAT/COMPLETIONS` does not match `/v1/chat/completions`
 - **`*` matches exactly one non-empty segment** — it never matches empty strings

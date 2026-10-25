@@ -328,6 +328,18 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject dot segments and backslashes rather than cleaning them. The
+	// policy matches segments literally, while many upstreams resolve
+	// "/allowed/../admin" to "/admin" or treat "\" as a separator.
+	if hasAmbiguousPath(r.URL.Path) {
+		rt.logger.Warn("rejected request with dot segment or backslash in path",
+			"path", r.URL.Path,
+			"remote", r.RemoteAddr,
+		)
+		http.Error(w, "Bad Request: dot segments and backslashes not allowed in path", http.StatusBadRequest)
+		return
+	}
+
 	route := rt.matchRoute(r.URL.Path)
 	if route == nil {
 		http.NotFound(w, r)
@@ -352,6 +364,20 @@ func containsEncodedPathSep(rawPath, escapedPath string) bool {
 	return strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c")
 }
 
+// hasAmbiguousPath reports whether the decoded path contains a "." or ".."
+// segment or a backslash.
+func hasAmbiguousPath(p string) bool {
+	if strings.ContainsRune(p, '\\') {
+		return true
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func (rt *Router) matchRoute(path string) *Route {
 	rt.mu.RLock()
 	routes := rt.routes
@@ -372,6 +398,12 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 	targetPath := strings.TrimPrefix(r.URL.Path, route.StripPrefix)
 	if targetPath == "" {
 		targetPath = "/"
+	}
+	// strip_prefix can expose a dot segment, e.g. "/api../x" with
+	// strip_prefix "/api" leaves "../x".
+	if hasAmbiguousPath(targetPath) {
+		http.Error(w, "Bad Request: dot segments and backslashes not allowed in path", http.StatusBadRequest)
+		return
 	}
 
 	// Start OTel span
