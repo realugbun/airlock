@@ -288,6 +288,11 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 				}
 				resp.ContentLength = -1
 				resp.Header.Del("Content-Length")
+
+				// Trailers, declared or not, are filled in when the upstream
+				// body reaches EOF and copied to the agent after the body.
+				// Redact them at that point.
+				resp.Body = &trailerRedactingBody{ReadCloser: resp.Body, resp: resp, secrets: redactValues}
 			}
 
 			return nil
@@ -493,6 +498,10 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 	// Store redact values in context for ModifyResponse to use.
 	if len(redactValues) > 0 {
 		ctx = withRedactValues(ctx, redactValues)
+		// ReverseProxy forwards 1xx responses (e.g. 103 Early Hints) as soon
+		// as they arrive, before ModifyResponse can redact their headers.
+		// Drop them on credentialed routes.
+		w = &informationalSuppressingWriter{ResponseWriter: w}
 		// Response redaction operates on the decoded body. If the upstream
 		// compresses the response (Content-Encoding: gzip/br/zstd), the
 		// redacting readers would (a) scan compressed bytes and silently miss
@@ -626,4 +635,58 @@ func headerValuesContainToken(values []string, token string) bool {
 		}
 	}
 	return false
+}
+
+// trailerRedactingBody redacts the response trailers once the body has been
+// read to the end, which is when the transport populates them.
+type trailerRedactingBody struct {
+	io.ReadCloser
+	resp    *http.Response
+	secrets []string
+	done    bool
+}
+
+func (b *trailerRedactingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.redact()
+	}
+	return n, err
+}
+
+func (b *trailerRedactingBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.redact()
+	return err
+}
+
+func (b *trailerRedactingBody) redact() {
+	if b.done {
+		return
+	}
+	b.done = true
+	if len(b.resp.Trailer) > 0 {
+		redactHeaderValues(b.resp.Trailer, b.secrets)
+	}
+}
+
+// informationalSuppressingWriter drops 1xx informational responses other
+// than 101 Switching Protocols.
+type informationalSuppressingWriter struct {
+	http.ResponseWriter
+}
+
+func (w *informationalSuppressingWriter) WriteHeader(code int) {
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		return
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *informationalSuppressingWriter) Flush() {
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *informationalSuppressingWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

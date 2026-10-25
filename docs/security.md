@@ -8,7 +8,7 @@ This document covers Airlock's security model, threat model, path normalization,
 
 - **Direct credential exposure to the agent.** In the documented deployment model, the agent is not given real upstream API credentials directly. Airlock injects credentials at the network boundary.
 - **Unauthorized API operations.** Firewall-style access rules restrict which HTTP methods and paths the agent can call. MCP tool filtering restricts which JSON-RPC tools the agent can invoke.
-- **Credential leakage in responses.** Airlock redacts injected credentials from proxied response headers and bodies, including SSE streams.
+- **Credential leakage in responses.** Airlock redacts injected credentials from proxied response headers, trailers and bodies, including SSE streams. On routes that inject a credential, upstream 1xx informational responses (such as `103 Early Hints`) are not forwarded.
 - **Uncontrolled blast radius.** Per-route rate limiting and timeouts prevent a single agent from exhausting upstream API quotas or hanging indefinitely.
 
 ### Assumptions
