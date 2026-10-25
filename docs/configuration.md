@@ -40,7 +40,7 @@ routes:
     idle_timeout: "60s"               # Idle stream timeout (default 60s, 0 to disable)
     strip_agent_auth: false            # Strip incoming auth headers before injecting
     extra_headers:                     # Additional headers to inject upstream
-      X-Custom: "value"
+      X-Custom: "value"               # Hop-by-hop names (Connection, TE, Upgrade, ...) are rejected
 
     auth:
       type: static                    # "static", "oauth2", or "none"

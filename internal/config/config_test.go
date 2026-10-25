@@ -722,3 +722,50 @@ routes:
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "auth.header is required")
 }
+
+func TestLoadConfig_RejectsHopByHopInjectedHeaders(t *testing.T) {
+	route := func(extra string) string {
+		return `
+service: "test-svc"
+strict: false
+providers:
+  env: {}
+routes:
+  - path_prefix: "/api"
+    upstream: "https://api.example.com"
+` + extra
+	}
+	cases := map[string]string{
+		"auth header Connection": `    auth:
+      type: static
+      token: {from: env, key: KEY}
+      header: "connection"
+`,
+		"auth header Proxy-Authorization": `    auth:
+      type: static
+      token: {from: env, key: KEY}
+      header: "Proxy-Authorization"
+`,
+		"extra header TE": `    auth: {type: none}
+    extra_headers:
+      te: "trailers"
+`,
+		"extra header Upgrade": `    auth: {type: none}
+    extra_headers:
+      Upgrade: "h2c"
+`,
+		"extra header Keep-Alive": `    auth: {type: none}
+    extra_headers:
+      KEEP-ALIVE: "timeout=5"
+`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(route(body)), 0o600))
+			_, err := Load(path)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "hop-by-hop")
+		})
+	}
+}

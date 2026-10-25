@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -457,6 +458,11 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	// Remove hop-by-hop headers before injecting credentials. Otherwise an
+	// agent can send "Connection: Authorization" and ReverseProxy deletes
+	// the injected header after the Director has run.
+	removeHopByHopHeaders(r.Header)
+
 	// Strip agent-supplied auth headers before injecting real credentials.
 	if route.StripAgentAuth {
 		r.Header.Del("Authorization")
@@ -564,4 +570,60 @@ func (rt *Router) rejectMCPRequest(ctx context.Context, w http.ResponseWriter, r
 		"error", err.Error(),
 	)
 	http.Error(w, msg, status)
+}
+
+// hopByHopHeaders are the standard hop-by-hop headers removed by
+// httputil.ReverseProxy, plus Proxy-Connection.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// removeHopByHopHeaders deletes the Connection header, every header it
+// nominates, and the standard hop-by-hop headers. Like ReverseProxy, it
+// keeps "Te: trailers" and an Upgrade request, which ReverseProxy re-adds
+// itself and which cannot nominate anything once rebuilt here.
+func removeHopByHopHeaders(h http.Header) {
+	upgrade := ""
+	if headerValuesContainToken(h["Connection"], "upgrade") {
+		upgrade = h.Get("Upgrade")
+	}
+	teTrailers := headerValuesContainToken(h["Te"], "trailers")
+
+	for _, v := range h["Connection"] {
+		for _, f := range strings.Split(v, ",") {
+			if f = textproto.TrimString(f); f != "" {
+				h.Del(f)
+			}
+		}
+	}
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
+
+	if teTrailers {
+		h.Set("Te", "trailers")
+	}
+	if upgrade != "" {
+		h.Set("Connection", "Upgrade")
+		h.Set("Upgrade", upgrade)
+	}
+}
+
+func headerValuesContainToken(values []string, token string) bool {
+	for _, v := range values {
+		for _, f := range strings.Split(v, ",") {
+			if strings.EqualFold(textproto.TrimString(f), token) {
+				return true
+			}
+		}
+	}
+	return false
 }

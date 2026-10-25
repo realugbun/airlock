@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net/textproto"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/realugbun/airlock/pkg/secrets"
@@ -209,6 +211,14 @@ func (c *Config) validate() error {
 		if r.Auth.Type != "none" && r.Auth.Header == "" {
 			return fmt.Errorf("route %d: auth.header is required", i)
 		}
+		if r.Auth.Header != "" && isHopByHopHeader(r.Auth.Header) {
+			return fmt.Errorf("route %d: auth.header %q is a hop-by-hop header and would not reach the upstream", i, r.Auth.Header)
+		}
+		for name := range r.ExtraHeaders {
+			if isHopByHopHeader(name) {
+				return fmt.Errorf("route %d: extra_headers %q is a hop-by-hop header and would not reach the upstream", i, name)
+			}
+		}
 		if r.MCPRules != nil && len(r.MCPRules.AllowedTools) > 0 && len(r.MCPRules.DeniedTools) > 0 {
 			return fmt.Errorf("route %d: mcp_rules cannot have both allowed_tools and denied_tools", i)
 		}
@@ -231,4 +241,15 @@ func (c *Config) validate() error {
 	}
 
 	return nil
+}
+
+// isHopByHopHeader reports whether name is a header that proxies remove
+// before forwarding, so a value injected under that name never arrives.
+func isHopByHopHeader(name string) bool {
+	switch textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(name)) {
+	case "Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
+		"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade":
+		return true
+	}
+	return false
 }

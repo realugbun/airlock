@@ -40,6 +40,10 @@ This document covers Airlock's security model, threat model, path normalization,
 - [ ] Review MCP rules: use `allowed_tools` for strict control, check logs for `MCP tools discovered`
 - [ ] One Airlock per agent — the sidecar model is the default security boundary
 
+## Injected Headers
+
+Before injecting credentials and `extra_headers`, Airlock removes the agent's `Connection` header, every header it names, and the standard hop-by-hop headers. Otherwise `Connection: Authorization` would make the proxy drop the injected credential. `auth.header` and `extra_headers` may not be hop-by-hop names.
+
 ## MCP Request Inspection
 
 On a route whose `mcp_rules` lists `allowed_tools` or `denied_tools`, a POST body that Airlock cannot inspect exactly as the upstream will read it is rejected, never forwarded:
