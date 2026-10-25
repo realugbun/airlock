@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -148,4 +149,28 @@ func TestRouter_ToolsListResponseCap(t *testing.T) {
 		assert.Contains(t, string(body), `"read"`)
 		assert.NotContains(t, string(body), "delete_all")
 	})
+}
+
+// When the connection deadline wins the race, the context ends with
+// Canceled rather than DeadlineExceeded. That must still classify as a timeout.
+func TestReadBodyContext_CanceledAfterDeadlineIsTimeout(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(parent, 20*time.Millisecond)
+	defer cancel()
+	time.AfterFunc(20*time.Millisecond, cancelParent)
+
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	time.Sleep(30 * time.Millisecond) // both have fired; ctx.Err may be either
+	_, err := readBodyContext(ctx, pr, 10)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// Before the deadline, cancellation is not a timeout.
+	parent2, cancel2 := context.WithCancel(context.Background())
+	ctx2, cancel3 := context.WithTimeout(parent2, time.Hour)
+	defer cancel3()
+	cancel2()
+	_, err = readBodyContext(ctx2, pr, 10)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, context.DeadlineExceeded)
 }

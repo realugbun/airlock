@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -282,6 +283,12 @@ func (p *MCPToolPolicy) observeRequest(r *http.Request) (*MCPCheckResult, error)
 // readBodyContext reads up to limit bytes from body, returning early with the
 // context error if ctx ends first. The abandoned read finishes in the
 // background once the connection read deadline fires or the client sends.
+//
+// Once ctx's deadline has passed, any failure is reported as
+// context.DeadlineExceeded. The connection read deadline is set to the same
+// instant, and when it fires first net/http cancels the connection context,
+// so ctx can end with context.Canceled and the read with some other error,
+// depending on which goroutine wins.
 func readBodyContext(ctx context.Context, body io.Reader, limit int64) ([]byte, error) {
 	if ctx.Done() == nil {
 		return io.ReadAll(io.LimitReader(body, limit))
@@ -295,12 +302,20 @@ func readBodyContext(ctx context.Context, body io.Reader, limit int64) ([]byte, 
 		b, err := io.ReadAll(io.LimitReader(body, limit))
 		ch <- result{b, err}
 	}()
+	var err error
 	select {
 	case res := <-ch:
-		return res.b, res.err
+		if res.err == nil {
+			return res.b, nil
+		}
+		err = res.err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		err = ctx.Err()
 	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return nil, fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
+	}
+	return nil, err
 }
 
 // rpcMessage is a JSON-RPC message as inspected by Airlock.
