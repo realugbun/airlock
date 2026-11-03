@@ -50,6 +50,12 @@ func (rw *responseWriter) Flush() {
 	}
 }
 
+// SetReadDeadline delegates to the underlying ResponseWriter so handlers can
+// bound how long they wait for a request body.
+func (rw *responseWriter) SetReadDeadline(deadline time.Time) error {
+	return http.NewResponseController(rw.ResponseWriter).SetReadDeadline(deadline)
+}
+
 // RequestLogger logs each request after the handler chain completes.
 func RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

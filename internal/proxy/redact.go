@@ -136,17 +136,63 @@ func (r *redactingReader) Close() error {
 // newSSERedactingReader wraps r for SSE streams. Any occurrence of secrets
 // in event data is replaced with [REDACTED]. If secrets is empty, r is
 // returned as-is.
+//
+// Redaction state carries across event batches and the safety flush, so a
+// secret split by a flush is still caught. Only a tail that could be the
+// start of a secret is held back; events end in "\n\n" and are normally
+// delivered whole and immediately.
 func newSSERedactingReader(r io.ReadCloser, secrets []string) io.ReadCloser {
 	tokens := prepareRedactTokens(secrets)
 	if tokens == nil {
 		return r
 	}
-	return newSSEEventReader(r, func(data []byte) []byte {
-		for _, tok := range tokens {
-			data = bytes.ReplaceAll(data, tok, redactedPlaceholder)
+	sr := &streamRedactor{tokens: tokens, maxLen: len(tokens[0])}
+	er := newSSEEventReader(r, sr.push)
+	er.final = sr.flush
+	return er
+}
+
+// streamRedactor replaces secrets in a stream delivered in arbitrary pieces.
+// It holds back the longest tail (shorter than the longest secret) that is
+// a prefix of some secret, and releases it with the next piece or at flush.
+type streamRedactor struct {
+	tokens [][]byte // sorted longest-first
+	maxLen int
+	held   []byte
+}
+
+func (s *streamRedactor) push(data []byte) []byte {
+	buf := make([]byte, 0, len(s.held)+len(data))
+	buf = append(buf, s.held...)
+	buf = append(buf, data...)
+	for _, tok := range s.tokens {
+		buf = bytes.ReplaceAll(buf, tok, redactedPlaceholder)
+	}
+	k := s.secretPrefixSuffixLen(buf)
+	s.held = append([]byte(nil), buf[len(buf)-k:]...)
+	return buf[:len(buf)-k]
+}
+
+// flush releases the held tail. It cannot contain a complete secret.
+func (s *streamRedactor) flush() []byte {
+	out := s.held
+	s.held = nil
+	return out
+}
+
+// secretPrefixSuffixLen returns the length of the longest suffix of buf that
+// is a proper prefix of a secret.
+func (s *streamRedactor) secretPrefixSuffixLen(buf []byte) int {
+	k := min(s.maxLen-1, len(buf))
+	for ; k > 0; k-- {
+		suffix := buf[len(buf)-k:]
+		for _, tok := range s.tokens {
+			if len(tok) > k && bytes.HasPrefix(tok, suffix) {
+				return k
+			}
 		}
-		return data
-	})
+	}
+	return 0
 }
 
 // redactHeaderValues scans all response header values for the given secrets

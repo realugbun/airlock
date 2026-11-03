@@ -3,13 +3,16 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"mime"
 	"net/http"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -218,27 +221,35 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 					resp.ContentLength = -1
 					resp.Header.Del("Content-Length")
 				} else {
-					// JSON: ReadAll is safe (server closes connection after response).
-					body, readErr := io.ReadAll(resp.Body)
+					// JSON: the whole response is buffered to filter it, so
+					// it is capped. Exceeding the cap is a 502, never a
+					// truncated or unfiltered tool list.
+					if resp.ContentLength > maxMCPResponseSize {
+						_ = resp.Body.Close()
+						return fmt.Errorf("tools/list response of %d bytes exceeds %d byte limit", resp.ContentLength, maxMCPResponseSize)
+					}
+					body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxMCPResponseSize+1))
 					_ = resp.Body.Close()
 					if readErr != nil {
-						resp.Body = io.NopCloser(bytes.NewReader(nil))
+						return fmt.Errorf("reading tools/list response: %w", readErr)
+					}
+					if len(body) > maxMCPResponseSize {
+						return fmt.Errorf("tools/list response exceeds %d byte limit", maxMCPResponseSize)
+					}
+					fr, filterErr := mcpInfo.Policy.FilterToolsListResponse(body, ct)
+					if filterErr == nil && fr.AllTools != nil {
+						logger.Info("MCP tools discovered",
+							"route", routePrefix,
+							"upstream_tools", fr.AllTools,
+							"allowed_tools", fr.AllowedTools,
+							"upstream_count", len(fr.AllTools),
+							"allowed_count", len(fr.AllowedTools),
+						)
+						resp.Body = io.NopCloser(bytes.NewReader(fr.Body))
+						resp.ContentLength = int64(len(fr.Body))
+						resp.Header.Set("Content-Length", strconv.Itoa(len(fr.Body)))
 					} else {
-						fr, filterErr := mcpInfo.Policy.FilterToolsListResponse(body, ct)
-						if filterErr == nil && fr.AllTools != nil {
-							logger.Info("MCP tools discovered",
-								"route", routePrefix,
-								"upstream_tools", fr.AllTools,
-								"allowed_tools", fr.AllowedTools,
-								"upstream_count", len(fr.AllTools),
-								"allowed_count", len(fr.AllowedTools),
-							)
-							resp.Body = io.NopCloser(bytes.NewReader(fr.Body))
-							resp.ContentLength = int64(len(fr.Body))
-							resp.Header.Set("Content-Length", strconv.Itoa(len(fr.Body)))
-						} else {
-							resp.Body = io.NopCloser(bytes.NewReader(body))
-						}
+						resp.Body = io.NopCloser(bytes.NewReader(body))
 					}
 				}
 				mcpFiltered = true
@@ -286,6 +297,11 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 				}
 				resp.ContentLength = -1
 				resp.Header.Del("Content-Length")
+
+				// Trailers, declared or not, are filled in when the upstream
+				// body reaches EOF and copied to the agent after the body.
+				// Redact them at that point.
+				resp.Body = &trailerRedactingBody{ReadCloser: resp.Body, resp: resp, secrets: redactValues}
 			}
 
 			return nil
@@ -321,6 +337,18 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject dot segments and backslashes rather than cleaning them. The
+	// policy matches segments literally, while many upstreams resolve
+	// "/allowed/../admin" to "/admin" or treat "\" as a separator.
+	if hasAmbiguousPath(r.URL.Path) {
+		rt.logger.Warn("rejected request with dot segment or backslash in path",
+			"path", r.URL.Path,
+			"remote", r.RemoteAddr,
+		)
+		http.Error(w, "Bad Request: dot segments and backslashes not allowed in path", http.StatusBadRequest)
+		return
+	}
+
 	route := rt.matchRoute(r.URL.Path)
 	if route == nil {
 		http.NotFound(w, r)
@@ -345,6 +373,20 @@ func containsEncodedPathSep(rawPath, escapedPath string) bool {
 	return strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c")
 }
 
+// hasAmbiguousPath reports whether the decoded path contains a "." or ".."
+// segment or a backslash.
+func hasAmbiguousPath(p string) bool {
+	if strings.ContainsRune(p, '\\') {
+		return true
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func (rt *Router) matchRoute(path string) *Route {
 	rt.mu.RLock()
 	routes := rt.routes
@@ -362,9 +404,28 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 	ctx := r.Context()
 	correlationID := airlocklog.CorrelationIDFromContext(ctx)
 
+	// The route timeout covers the whole request, including reading and
+	// inspecting the body and resolving secrets. A context alone does not
+	// interrupt a blocked body read, so also set a read deadline on the
+	// connection where the ResponseWriter supports it.
+	if route.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, route.Timeout)
+		defer cancel()
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = http.NewResponseController(w).SetReadDeadline(deadline)
+		}
+	}
+
 	targetPath := strings.TrimPrefix(r.URL.Path, route.StripPrefix)
 	if targetPath == "" {
 		targetPath = "/"
+	}
+	// strip_prefix can expose a dot segment, e.g. "/api../x" with
+	// strip_prefix "/api" leaves "../x".
+	if hasAmbiguousPath(targetPath) {
+		http.Error(w, "Bad Request: dot segments and backslashes not allowed in path", http.StatusBadRequest)
+		return
 	}
 
 	// Start OTel span
@@ -421,15 +482,7 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 	if route.MCPRules != nil {
 		mcpResult, mcpErr := route.MCPRules.CheckRequest(r)
 		if mcpErr != nil {
-			if rl != nil {
-				rl.Message = "MCP body inspection failed"
-			}
-			rt.logger.Error("MCP body inspection failed",
-				"correlation_id", correlationID,
-				"route", route.PathPrefix,
-				"error", mcpErr.Error(),
-			)
-			http.Error(w, "Bad Request", http.StatusBadRequest)
+			rt.rejectMCPRequest(ctx, w, rl, span, route, correlationID, mcpErr)
 			return
 		}
 		// Store MCP info in context for ModifyResponse to use.
@@ -464,6 +517,11 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	// Remove hop-by-hop headers before injecting credentials. Otherwise an
+	// agent can send "Connection: Authorization" and ReverseProxy deletes
+	// the injected header after the Director has run.
+	removeHopByHopHeaders(r.Header)
+
 	// Strip agent-supplied auth headers before injecting real credentials.
 	if route.StripAgentAuth {
 		r.Header.Del("Authorization")
@@ -494,6 +552,10 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 	// Store redact values in context for ModifyResponse to use.
 	if len(redactValues) > 0 {
 		ctx = withRedactValues(ctx, redactValues)
+		// ReverseProxy forwards 1xx responses (e.g. 103 Early Hints) as soon
+		// as they arrive, before ModifyResponse can redact their headers.
+		// Drop them on credentialed routes.
+		w = &informationalSuppressingWriter{ResponseWriter: w}
 		// Response redaction operates on the decoded body. If the upstream
 		// compresses the response (Content-Encoding: gzip/br/zstd), the
 		// redacting readers would (a) scan compressed bytes and silently miss
@@ -512,12 +574,6 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 		r.Header.Del("If-Range")
 	}
 
-	// Apply request timeouts.
-	if route.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, route.Timeout)
-		defer cancel()
-	}
 	if route.IdleTimeout > 0 {
 		var idleCancel context.CancelFunc
 		ctx, idleCancel = withIdleCancel(ctx)
@@ -542,4 +598,147 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 		))
 
 	route.proxy.ServeHTTP(w, r)
+}
+
+// rejectMCPRequest writes the response for a request whose MCP body could not
+// be inspected. Policy rejections carry their own status; anything else is a
+// failure to read the request body.
+func (rt *Router) rejectMCPRequest(ctx context.Context, w http.ResponseWriter, rl *middleware.RequestLog, span trace.Span, route *Route, correlationID string, err error) {
+	status := http.StatusBadRequest
+	msg := "Bad Request: could not read request body"
+	var reqErr *MCPRequestError
+	switch {
+	case errors.As(err, &reqErr):
+		status = reqErr.Status
+		msg = http.StatusText(status) + ": " + reqErr.Reason
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded):
+		status = http.StatusRequestTimeout
+		msg = "Request Timeout: request body not received within the route timeout"
+	}
+	if rl != nil {
+		rl.Message = "MCP request rejected"
+	}
+	span.SetAttributes(attribute.String("status", "mcp_rejected"))
+	rt.requestCounter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("route", route.PathPrefix),
+			attribute.String("status", "mcp_rejected"),
+		))
+	rt.logger.Warn("MCP request rejected",
+		"correlation_id", correlationID,
+		"route", route.PathPrefix,
+		"status", status,
+		"error", err.Error(),
+	)
+	http.Error(w, msg, status)
+}
+
+// hopByHopHeaders are the standard hop-by-hop headers removed by
+// httputil.ReverseProxy, plus Proxy-Connection.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// removeHopByHopHeaders deletes the Connection header, every header it
+// nominates, and the standard hop-by-hop headers. Like ReverseProxy, it
+// keeps "Te: trailers" and an Upgrade request, which ReverseProxy re-adds
+// itself and which cannot nominate anything once rebuilt here.
+func removeHopByHopHeaders(h http.Header) {
+	upgrade := ""
+	if headerValuesContainToken(h["Connection"], "upgrade") {
+		upgrade = h.Get("Upgrade")
+	}
+	teTrailers := headerValuesContainToken(h["Te"], "trailers")
+
+	for _, v := range h["Connection"] {
+		for _, f := range strings.Split(v, ",") {
+			if f = textproto.TrimString(f); f != "" {
+				h.Del(f)
+			}
+		}
+	}
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
+
+	if teTrailers {
+		h.Set("Te", "trailers")
+	}
+	if upgrade != "" {
+		h.Set("Connection", "Upgrade")
+		h.Set("Upgrade", upgrade)
+	}
+}
+
+func headerValuesContainToken(values []string, token string) bool {
+	for _, v := range values {
+		for _, f := range strings.Split(v, ",") {
+			if strings.EqualFold(textproto.TrimString(f), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// trailerRedactingBody redacts the response trailers once the body has been
+// read to the end, which is when the transport populates them.
+type trailerRedactingBody struct {
+	io.ReadCloser
+	resp    *http.Response
+	secrets []string
+	done    bool
+}
+
+func (b *trailerRedactingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.redact()
+	}
+	return n, err
+}
+
+func (b *trailerRedactingBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.redact()
+	return err
+}
+
+func (b *trailerRedactingBody) redact() {
+	if b.done {
+		return
+	}
+	b.done = true
+	if len(b.resp.Trailer) > 0 {
+		redactHeaderValues(b.resp.Trailer, b.secrets)
+	}
+}
+
+// informationalSuppressingWriter drops 1xx informational responses other
+// than 101 Switching Protocols.
+type informationalSuppressingWriter struct {
+	http.ResponseWriter
+}
+
+func (w *informationalSuppressingWriter) WriteHeader(code int) {
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		return
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *informationalSuppressingWriter) Flush() {
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *informationalSuppressingWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

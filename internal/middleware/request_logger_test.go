@@ -3,9 +3,12 @@ package middleware
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	airlocklog "github.com/realugbun/airlock/pkg/log"
 	"github.com/stretchr/testify/assert"
@@ -63,4 +66,19 @@ func TestRequestLogger_Warn4xx(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "warn", entry["level"])
+}
+
+func TestRequestLogger_SupportsReadDeadline(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	errCh := make(chan error, 1)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		errCh <- http.NewResponseController(w).SetReadDeadline(time.Now().Add(time.Second))
+	})
+	srv := httptest.NewServer(RequestLogger(logger)(inner))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.NoError(t, <-errCh)
 }

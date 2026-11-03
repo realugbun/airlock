@@ -100,10 +100,7 @@ func main() {
 	handler = middleware.RequestLogger(logger)(handler)
 	handler = middleware.Correlation(handler)
 
-	server := &http.Server{
-		Addr:    cfg.Listen,
-		Handler: handler,
-	}
+	server := newServer(cfg.Listen, handler)
 
 	// Signal handling: SIGHUP reloads config, SIGINT/SIGTERM shuts down
 	go func() {
@@ -337,4 +334,23 @@ func parseDurationWithDefault(s string, def time.Duration) (time.Duration, error
 		return def, nil
 	}
 	return time.ParseDuration(s)
+}
+
+// Inbound server limits. There is deliberately no ReadTimeout or
+// WriteTimeout: either would cut off long-lived SSE streams. Per-route
+// timeouts bound each request, including reading its body.
+const (
+	serverReadHeaderTimeout = 10 * time.Second
+	serverIdleTimeout       = 120 * time.Second
+	serverMaxHeaderBytes    = 1 << 20 // 1 MiB
+)
+
+func newServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		IdleTimeout:       serverIdleTimeout,
+		MaxHeaderBytes:    serverMaxHeaderBytes,
+	}
 }

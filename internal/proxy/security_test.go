@@ -311,19 +311,18 @@ func TestSecurity_MCP_HomoglyphToolName(t *testing.T) {
 	assert.True(t, result.Denied)
 }
 
-func TestSecurity_MCP_OversizedBody_Passthrough(t *testing.T) {
+func TestSecurity_MCP_OversizedBody_Rejected(t *testing.T) {
 	p, _ := NewMCPToolPolicy(&MCPToolPolicyConfig{
 		AllowedTools: []string{"get_events"},
 	})
 
-	// Body larger than maxMCPBodySize (10MB) — should pass through without inspection
+	// Body larger than maxMCPBodySize (10MB) cannot be inspected, so it is rejected.
 	bigBody := strings.Repeat("x", 11*1024*1024)
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(bigBody))
 	req.Header.Set("Content-Type", "application/json")
 
-	result, err := p.CheckRequest(req)
-	require.NoError(t, err)
-	assert.False(t, result.Denied) // Not inspected, passes through
+	_, err := p.CheckRequest(req)
+	requireMCPReject(t, err, http.StatusRequestEntityTooLarge)
 }
 
 func TestSecurity_MCP_DuplicateNameField(t *testing.T) {
@@ -336,11 +335,9 @@ func TestSecurity_MCP_DuplicateNameField(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 
-	result, err := p.CheckRequest(req)
-	require.NoError(t, err)
-	// Go's json.Unmarshal takes the last value for duplicate keys
-	assert.True(t, result.Denied)
-	assert.Equal(t, "dangerous_tool", result.ToolName)
+	// Parsers disagree on which duplicate wins, so duplicates are rejected.
+	_, err := p.CheckRequest(req)
+	requireMCPReject(t, err, http.StatusBadRequest)
 }
 
 // =============================================================================

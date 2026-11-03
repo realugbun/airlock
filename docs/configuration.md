@@ -4,6 +4,8 @@ This document covers Airlock's full configuration including secret providers, au
 
 ## Full Configuration
 
+The file must be a single YAML document. Unknown keys are rejected at startup, so a typo such as `allowed_tool` fails instead of being ignored.
+
 ```yaml
 # ─── Server ───
 listen: ":8080"              # Listen address (default: ":8080")
@@ -40,7 +42,7 @@ routes:
     idle_timeout: "60s"               # Idle stream timeout (default 60s, 0 to disable)
     strip_agent_auth: false            # Strip incoming auth headers before injecting
     extra_headers:                     # Additional headers to inject upstream
-      X-Custom: "value"
+      X-Custom: "value"               # Hop-by-hop names (Connection, TE, Upgrade, ...) are rejected
 
     auth:
       type: static                    # "static", "oauth2", or "none"
@@ -64,8 +66,8 @@ routes:
       - Server
       - X-Powered-By
 
-    mcp_rules:                        # Optional — MCP tool-level filtering
-      allowed_tools:                  # Only these tools allowed (strict allowlist)
+    mcp_rules:                        # Optional — MCP tool-level filtering ({} = no filtering)
+      allowed_tools:                  # Only these tools allowed (strict allowlist; must not be empty)
         - get_events
         - list_calendars
         - "calendar_*"               # Glob patterns supported (*, ?, [chars])
