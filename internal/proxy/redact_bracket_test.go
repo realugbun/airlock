@@ -44,15 +44,46 @@ func TestRedactionSafe_BracketsRefused(t *testing.T) {
 	}
 }
 
-// With a bracketed credential the redacted body can contain the credential:
-// secrets {"XY", "]Z!"} turn the body "XYZ!" into "[REDACTED]Z!", which
-// contains "]Z!". This is why such a credential is refused at the router.
+// With a bracketed credential the redacted body can contain the credential.
+// Both cases below use a redaction set the auth providers really produce: the
+// bare token, and the prefix plus token.
 func TestRedact_PlaceholderCanRecreateBracketedSecret(t *testing.T) {
-	secrets := []string{"XY", "]Z!"}
-	out := oneShotRedact(secrets, []byte("XYZ!"))
+	cases := []struct {
+		name    string
+		secrets []string
+		body    string
+		want    string
+		secret  string
+	}{
+		{
+			name:    "bare token",
+			secrets: []string{"]Z!"},
+			body:    "]Z!Z!",
+			want:    "[REDACTED]Z!",
+			secret:  "]Z!",
+		},
+		{
+			name:    "token and prefixed token",
+			secrets: []string{"]Z!", "Bearer ]Z!"},
+			body:    "]Z!Z!",
+			want:    "[REDACTED]Z!",
+			secret:  "]Z!",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := oneShotRedact(tc.secrets, []byte(tc.body))
+			require.Equal(t, tc.want, string(out))
+			require.Contains(t, string(out), tc.secret,
+				"the placeholder re-formed the credential")
+			require.False(t, redactionSafe(tc.secrets))
+		})
+	}
+
+	// The same splice across two different secrets.
+	out := oneShotRedact([]string{"XY", "]Z!"}, []byte("XYZ!"))
 	require.Equal(t, "[REDACTED]Z!", string(out))
-	require.Contains(t, string(out), "]Z!", "the placeholder re-formed the secret")
-	require.False(t, redactionSafe(secrets))
+	require.Contains(t, string(out), "]Z!")
 }
 
 // bracketAuth injects a credential that contains a bracket, like a static

@@ -49,9 +49,10 @@ Before injecting credentials and `extra_headers`, Airlock removes the agent's `C
 Airlock redacts an injected credential from response headers, trailers and
 bodies by replacing it with the literal `[REDACTED]`. Because the placeholder
 opens with `[` and closes with `]`, a credential that itself contains `[` or
-`]` can be re-formed by a replacement sitting next to the bytes around it. With
-a credential `]Z!` and an injected header value `XY]Z!`, an upstream body of
-`XYZ!` redacts to `[REDACTED]Z!` — which contains the credential again.
+`]` can be re-formed by a replacement sitting next to the bytes around it. Take
+a credential of `]Z!`: an upstream body of `]Z!Z!` redacts to `[REDACTED]Z!`,
+and the `]` that closes the placeholder plus the `Z!` left behind spell the
+credential again. Redaction removed the credential and then wrote it back.
 
 **Airlock therefore refuses a request on a route whose resolved credential (or
 the injected header value built from `auth.prefix` plus the credential)
@@ -187,7 +188,7 @@ go test -fuzz=FuzzAccessPolicyBypass -fuzztime=10s ./internal/proxy/
 go test -fuzz=FuzzAccessPolicyBypass -fuzztime=5m ./internal/proxy/
 ```
 
-The six access rule targets have been run for millions of executions each with zero bypasses or panics found. The two redaction targets are run on every change to the redactors.
+The six access rule targets have been run for millions of executions each with zero bypasses or panics found. Run the redaction targets the same way (`go test -fuzz=FuzzRedactStreaming -fuzztime=60s ./internal/proxy/`) when changing the redactors; CI runs the seed corpus of every target as part of `go test`, not a fuzzing campaign.
 
 ## HTTP Status Codes
 
