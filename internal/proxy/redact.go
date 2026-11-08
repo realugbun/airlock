@@ -4,13 +4,15 @@ import (
 	"bytes"
 	"io"
 	"sort"
-	"strings"
 )
 
 var redactedPlaceholder = []byte("[REDACTED]")
 
 // prepareRedactTokens deduplicates, filters empty strings, and sorts
 // the given secrets longest-first. Returns nil if no valid tokens remain.
+//
+// Equal-length tokens are ordered lexicographically so that the replacement
+// order — and therefore the output — is deterministic for a given set.
 func prepareRedactTokens(secrets []string) [][]byte {
 	seen := make(map[string]struct{})
 	tokens := make([][]byte, 0, len(secrets))
@@ -28,24 +30,133 @@ func prepareRedactTokens(secrets []string) [][]byte {
 		return nil
 	}
 	sort.Slice(tokens, func(i, j int) bool {
-		return len(tokens[i]) > len(tokens[j])
+		if len(tokens[i]) != len(tokens[j]) {
+			return len(tokens[i]) > len(tokens[j])
+		}
+		return bytes.Compare(tokens[i], tokens[j]) < 0
 	})
 	return tokens
+}
+
+// redactAll replaces every occurrence of each token with the placeholder,
+// longest token first, over a complete buffer. It is the reference definition
+// of redaction; the streaming redactor reproduces it exactly for any chunking.
+func redactAll(tokens [][]byte, body []byte) []byte {
+	for _, tok := range tokens {
+		body = bytes.ReplaceAll(body, tok, redactedPlaceholder)
+	}
+	return body
+}
+
+// tokenReplacer applies a single token's ReplaceAll to a stream delivered in
+// arbitrary pieces. It replaces every complete occurrence it can see and holds
+// back only the longest tail that is a proper prefix of the token, since that
+// tail is the only part the next piece can turn into a match. Everything it
+// returns is final, so the concatenated output equals ReplaceAll over the
+// concatenated input regardless of how the input was split.
+type tokenReplacer struct {
+	tok  []byte
+	held []byte
+}
+
+func (t *tokenReplacer) push(data []byte) []byte {
+	if len(data) == 0 && len(t.held) == 0 {
+		return nil
+	}
+	buf := make([]byte, 0, len(t.held)+len(data))
+	buf = append(buf, t.held...)
+	buf = append(buf, data...)
+
+	out := make([]byte, 0, len(buf))
+	i := 0
+	for {
+		idx := bytes.Index(buf[i:], t.tok)
+		if idx < 0 {
+			break
+		}
+		out = append(out, buf[i:i+idx]...)
+		out = append(out, redactedPlaceholder...)
+		i += idx + len(t.tok)
+	}
+
+	rest := buf[i:]
+	k := tokenPrefixSuffixLen(rest, t.tok)
+	out = append(out, rest[:len(rest)-k]...)
+	t.held = append([]byte(nil), rest[len(rest)-k:]...)
+	return out
+}
+
+// flush releases the held tail, which cannot contain a complete occurrence of
+// this replacer's token.
+func (t *tokenReplacer) flush() []byte {
+	out := t.held
+	t.held = nil
+	return out
+}
+
+// tokenPrefixSuffixLen returns the length of the longest suffix of b that is a
+// proper prefix of tok.
+func tokenPrefixSuffixLen(b, tok []byte) int {
+	k := min(len(tok)-1, len(b))
+	for ; k > 0; k-- {
+		if bytes.HasPrefix(tok, b[len(b)-k:]) {
+			return k
+		}
+	}
+	return 0
+}
+
+// streamRedactor replaces secrets in a stream delivered in arbitrary pieces.
+// It is a cascade of one tokenReplacer per secret, longest secret first, which
+// is the streaming form of redactAll: each stage's output is the next stage's
+// input, so pushing a body in any number of pieces and then flushing produces
+// exactly redactAll of that body.
+type streamRedactor struct {
+	stages []*tokenReplacer
+}
+
+func newStreamRedactor(tokens [][]byte) *streamRedactor {
+	stages := make([]*tokenReplacer, 0, len(tokens))
+	for _, tok := range tokens {
+		stages = append(stages, &tokenReplacer{tok: tok})
+	}
+	return &streamRedactor{stages: stages}
+}
+
+func (s *streamRedactor) push(data []byte) []byte {
+	for _, stage := range s.stages {
+		data = stage.push(data)
+	}
+	return data
+}
+
+// flush drains every stage in order. A stage's held tail can still contain a
+// shorter secret, so it is pushed through the stages behind it before that
+// stage is drained in turn.
+func (s *streamRedactor) flush() []byte {
+	var out []byte
+	for i, stage := range s.stages {
+		data := stage.flush()
+		for _, next := range s.stages[i+1:] {
+			data = next.push(data)
+		}
+		out = append(out, data...)
+	}
+	return out
 }
 
 // redactingReader wraps an io.ReadCloser and replaces all occurrences of
 // sensitive credential strings with "[REDACTED]" in a streaming fashion.
 //
-// It uses a carry buffer of maxTokenLen-1 bytes to handle tokens that span
-// chunk boundaries. Tokens are sorted longest-first so that "Bearer sk-abc"
+// Redaction state carries across reads, and only a tail that could still begin
+// a secret is held back, so the output does not depend on where the upstream
+// splits the body. Secrets are replaced longest-first so that "Bearer sk-abc"
 // is replaced before "sk-abc" (preventing orphaned prefixes).
 type redactingReader struct {
 	inner   io.ReadCloser
-	tokens  [][]byte // sorted longest-first
-	carry   []byte   // leftover bytes from previous read
-	maxLen  int      // length of longest token
-	buf     []byte   // scratch buffer for reading from inner
-	out     []byte   // buffered output that didn't fit in caller's p
+	sr      *streamRedactor
+	buf     []byte // scratch buffer for reading from inner
+	out     []byte // buffered output that didn't fit in caller's p
 	srcDone bool
 }
 
@@ -57,10 +168,9 @@ func newRedactingReader(r io.ReadCloser, secrets []string) io.ReadCloser {
 		return r
 	}
 	return &redactingReader{
-		inner:  r,
-		tokens: tokens,
-		maxLen: len(tokens[0]), // tokens sorted longest-first
-		buf:    make([]byte, 32*1024),
+		inner: r,
+		sr:    newStreamRedactor(tokens),
+		buf:   make([]byte, 32*1024),
 	}
 }
 
@@ -72,58 +182,39 @@ func (r *redactingReader) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
-	if r.srcDone && len(r.carry) == 0 {
+	if r.srcDone {
 		return 0, io.EOF
 	}
 
 	// Read new data from the underlying reader.
-	var n int
-	var readErr error
-	if !r.srcDone {
-		n, readErr = r.inner.Read(r.buf)
-		if readErr != nil && readErr != io.EOF {
-			return 0, readErr
-		}
-		if readErr == io.EOF {
-			r.srcDone = true
-		}
+	n, readErr := r.inner.Read(r.buf)
+	if readErr != nil && readErr != io.EOF {
+		return 0, readErr
 	}
 
-	// Combine carry + new data.
-	combined := make([]byte, len(r.carry)+n)
-	copy(combined, r.carry)
-	copy(combined[len(r.carry):], r.buf[:n])
-	r.carry = nil
-
-	// Replace all token occurrences.
-	for _, tok := range r.tokens {
-		combined = bytes.ReplaceAll(combined, tok, redactedPlaceholder)
+	data := r.sr.push(r.buf[:n])
+	if readErr == io.EOF {
+		r.srcDone = true
+		// The held tails are released only here, so no data is lost.
+		data = append(data, r.sr.flush()...)
 	}
 
-	// If the source is not done, hold back the last maxLen-1 bytes as carry
-	// because a token could straddle the chunk boundary.
-	if !r.srcDone {
-		if len(combined) >= r.maxLen {
-			splitAt := len(combined) - (r.maxLen - 1)
-			r.carry = make([]byte, len(combined)-splitAt)
-			copy(r.carry, combined[splitAt:])
-			combined = combined[:splitAt]
-		} else {
-			// Not enough data to flush anything yet; carry everything.
-			r.carry = combined
-			return 0, nil
+	if len(data) == 0 {
+		if r.srcDone {
+			return 0, io.EOF
 		}
+		// Everything read so far could still begin a secret.
+		return 0, nil
 	}
 
 	// Copy the safe portion to the caller's buffer.
-	copied := copy(p, combined)
-	if copied < len(combined) {
+	copied := copy(p, data)
+	if copied < len(data) {
 		// Didn't fit — buffer the rest for the next Read call.
-		r.out = make([]byte, len(combined)-copied)
-		copy(r.out, combined[copied:])
+		r.out = append([]byte(nil), data[copied:]...)
 	}
 
-	if r.srcDone && len(r.out) == 0 && len(r.carry) == 0 {
+	if r.srcDone && len(r.out) == 0 {
 		return copied, io.EOF
 	}
 	return copied, nil
@@ -146,76 +237,23 @@ func newSSERedactingReader(r io.ReadCloser, secrets []string) io.ReadCloser {
 	if tokens == nil {
 		return r
 	}
-	sr := &streamRedactor{tokens: tokens, maxLen: len(tokens[0])}
+	sr := newStreamRedactor(tokens)
 	er := newSSEEventReader(r, sr.push)
 	er.final = sr.flush
 	return er
-}
-
-// streamRedactor replaces secrets in a stream delivered in arbitrary pieces.
-// It holds back the longest tail (shorter than the longest secret) that is
-// a prefix of some secret, and releases it with the next piece or at flush.
-type streamRedactor struct {
-	tokens [][]byte // sorted longest-first
-	maxLen int
-	held   []byte
-}
-
-func (s *streamRedactor) push(data []byte) []byte {
-	buf := make([]byte, 0, len(s.held)+len(data))
-	buf = append(buf, s.held...)
-	buf = append(buf, data...)
-	for _, tok := range s.tokens {
-		buf = bytes.ReplaceAll(buf, tok, redactedPlaceholder)
-	}
-	k := s.secretPrefixSuffixLen(buf)
-	s.held = append([]byte(nil), buf[len(buf)-k:]...)
-	return buf[:len(buf)-k]
-}
-
-// flush releases the held tail. It cannot contain a complete secret.
-func (s *streamRedactor) flush() []byte {
-	out := s.held
-	s.held = nil
-	return out
-}
-
-// secretPrefixSuffixLen returns the length of the longest suffix of buf that
-// is a proper prefix of a secret.
-func (s *streamRedactor) secretPrefixSuffixLen(buf []byte) int {
-	k := min(s.maxLen-1, len(buf))
-	for ; k > 0; k-- {
-		suffix := buf[len(buf)-k:]
-		for _, tok := range s.tokens {
-			if len(tok) > k && bytes.HasPrefix(tok, suffix) {
-				return k
-			}
-		}
-	}
-	return 0
 }
 
 // redactHeaderValues scans all response header values for the given secrets
 // and replaces occurrences with [REDACTED]. Secrets are processed longest-first
 // so that "Bearer sk-abc" is replaced before "sk-abc".
 func redactHeaderValues(headers map[string][]string, secrets []string) {
-	// Sort longest-first to match the body reader behavior.
-	sorted := make([]string, 0, len(secrets))
-	for _, s := range secrets {
-		if s != "" {
-			sorted = append(sorted, s)
-		}
+	tokens := prepareRedactTokens(secrets)
+	if tokens == nil {
+		return
 	}
-	sort.Slice(sorted, func(i, j int) bool {
-		return len(sorted[i]) > len(sorted[j])
-	})
-
 	for name, vals := range headers {
 		for i, v := range vals {
-			for _, secret := range sorted {
-				v = strings.ReplaceAll(v, secret, "[REDACTED]")
-			}
-			headers[name][i] = v
+			headers[name][i] = string(redactAll(tokens, []byte(v)))
 		}
 	}
 }
