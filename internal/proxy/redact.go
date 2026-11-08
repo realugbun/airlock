@@ -62,8 +62,9 @@ func redactAll(tokens [][]byte, body []byte) []byte {
 // those two bytes. A secret containing neither can therefore only reappear
 // inside a placeholder — that is, as a substring of the constant placeholder
 // text, which carries no information about the secret. A secret containing
-// '[' or ']' has no such guarantee: with secrets {"XY", "]Z!"} the body
-// "XYZ!" redacts to "[REDACTED]Z!", which contains "]Z!".
+// '[' or ']' has no such guarantee: for a credential of "]Z!" the body "]Z!Z!"
+// redacts to "[REDACTED]Z!", in which the placeholder's closing ']' and the
+// trailing "Z!" spell the credential again.
 func redactionSafe(secrets []string) bool {
 	for _, s := range secrets {
 		if strings.ContainsAny(s, placeholderMeta) {
@@ -183,6 +184,7 @@ type redactingReader struct {
 	buf     []byte // scratch buffer for reading from inner
 	out     []byte // buffered output that didn't fit in caller's p
 	srcDone bool
+	err     error // terminal error to return once out is drained
 }
 
 // newRedactingReader wraps r so that any occurrence of the given secrets
@@ -204,29 +206,33 @@ func (r *redactingReader) Read(p []byte) (int, error) {
 	if len(r.out) > 0 {
 		n := copy(p, r.out)
 		r.out = r.out[n:]
+		if len(r.out) == 0 && r.srcDone {
+			return n, r.terminalErr()
+		}
 		return n, nil
 	}
 
 	if r.srcDone {
-		return 0, io.EOF
+		return 0, r.terminalErr()
 	}
 
-	// Read new data from the underlying reader.
+	// Read new data from the underlying reader. Bytes delivered alongside an
+	// error still belong to the client, so they are redacted and returned
+	// before the error is.
 	n, readErr := r.inner.Read(r.buf)
-	if readErr != nil && readErr != io.EOF {
-		return 0, readErr
-	}
-
 	data := r.sr.push(r.buf[:n])
-	if readErr == io.EOF {
+	if readErr != nil {
 		r.srcDone = true
+		if readErr != io.EOF {
+			r.err = readErr
+		}
 		// The held tails are released only here, so no data is lost.
 		data = append(data, r.sr.flush()...)
 	}
 
 	if len(data) == 0 {
 		if r.srcDone {
-			return 0, io.EOF
+			return 0, r.terminalErr()
 		}
 		// Everything read so far could still begin a secret.
 		return 0, nil
@@ -235,14 +241,24 @@ func (r *redactingReader) Read(p []byte) (int, error) {
 	// Copy the safe portion to the caller's buffer.
 	copied := copy(p, data)
 	if copied < len(data) {
-		// Didn't fit — buffer the rest for the next Read call.
+		// Didn't fit — buffer the rest, and the error, for the next Read call.
 		r.out = append([]byte(nil), data[copied:]...)
+		return copied, nil
 	}
 
-	if r.srcDone && len(r.out) == 0 {
-		return copied, io.EOF
+	if r.srcDone {
+		return copied, r.terminalErr()
 	}
 	return copied, nil
+}
+
+// terminalErr is the error to report once every redacted byte has been
+// delivered: the upstream's error if it failed, io.EOF otherwise.
+func (r *redactingReader) terminalErr() error {
+	if r.err != nil {
+		return r.err
+	}
+	return io.EOF
 }
 
 func (r *redactingReader) Close() error {

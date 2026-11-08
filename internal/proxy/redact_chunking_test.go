@@ -2,8 +2,10 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"testing"
+	"testing/iotest"
 
 	"github.com/stretchr/testify/require"
 )
@@ -211,4 +213,30 @@ func TestRedact_SecretAcrossReadBufferBoundary(t *testing.T) {
 		require.Equal(t, string(oneShotRedact(secrets, body)), string(got), "offset %d", off)
 		require.NotContains(t, string(got), "sk-boundary")
 	}
+}
+
+// Bytes the upstream delivered before failing still belong to the client, and
+// so does the held tail, so both are returned before the error is.
+func TestRedact_DataDeliveredBeforeNonEOFError(t *testing.T) {
+	secrets := []string{"sk-9", "Bearer sk-9"}
+	boom := errors.New("upstream reset")
+	inner := io.NopCloser(io.MultiReader(
+		newSplitReader([]byte("head Bearer sk-9 tail sk-")),
+		iotest.ErrReader(boom),
+	))
+
+	r := newRedactingReader(inner, secrets)
+	var got []byte
+	p := make([]byte, 8)
+	var err error
+	for {
+		var n int
+		n, err = r.Read(p)
+		got = append(got, p[:n]...)
+		if err != nil {
+			break
+		}
+	}
+	require.ErrorIs(t, err, boom)
+	require.Equal(t, "head [REDACTED] tail sk-", string(got))
 }
