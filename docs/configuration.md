@@ -172,6 +172,11 @@ auth:
   prefix: "Bearer "
 ```
 
+The injected credential — the resolved token and `prefix` plus token — may not
+contain `[` or `]`. Those are the delimiters of the `[REDACTED]` placeholder, so
+such a value cannot be reliably redacted from a response; a request on the route
+is refused with `500` instead. See [docs/security.md](security.md#credential-characters-and-redaction).
+
 ### OAuth2 (Refresh Token Flow)
 
 Automatically manages access tokens using a refresh token:

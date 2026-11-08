@@ -4,9 +4,15 @@ import (
 	"bytes"
 	"io"
 	"sort"
+	"strings"
 )
 
 var redactedPlaceholder = []byte("[REDACTED]")
+
+// placeholderMeta are the bytes of redactedPlaceholder that make a credential
+// containing them unsafe to redact: a replacement can sit next to body bytes
+// and the result can spell the credential again. See redactionSafe.
+const placeholderMeta = "[]"
 
 // prepareRedactTokens deduplicates, filters empty strings, and sorts
 // the given secrets longest-first. Returns nil if no valid tokens remain.
@@ -46,6 +52,25 @@ func redactAll(tokens [][]byte, body []byte) []byte {
 		body = bytes.ReplaceAll(body, tok, redactedPlaceholder)
 	}
 	return body
+}
+
+// redactionSafe reports whether secrets can be redacted without the output
+// being able to spell a secret again.
+//
+// The placeholder opens with '[' and closes with ']', so any span of output
+// that overlaps a replacement without being contained in it includes one of
+// those two bytes. A secret containing neither can therefore only reappear
+// inside a placeholder — that is, as a substring of the constant placeholder
+// text, which carries no information about the secret. A secret containing
+// '[' or ']' has no such guarantee: with secrets {"XY", "]Z!"} the body
+// "XYZ!" redacts to "[REDACTED]Z!", which contains "]Z!".
+func redactionSafe(secrets []string) bool {
+	for _, s := range secrets {
+		if strings.ContainsAny(s, placeholderMeta) {
+			return false
+		}
+	}
+	return true
 }
 
 // tokenReplacer applies a single token's ReplaceAll to a stream delivered in

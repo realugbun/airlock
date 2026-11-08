@@ -8,7 +8,7 @@ This document covers Airlock's security model, threat model, path normalization,
 
 - **Direct credential exposure to the agent.** In the documented deployment model, the agent is not given real upstream API credentials directly. Airlock injects credentials at the network boundary.
 - **Unauthorized API operations.** Firewall-style access rules restrict which HTTP methods and paths the agent can call. MCP tool filtering restricts which JSON-RPC tools the agent can invoke.
-- **Credential leakage in responses.** Airlock redacts injected credentials from proxied response headers, trailers and bodies, including SSE streams. On routes that inject a credential, upstream 1xx informational responses (such as `103 Early Hints`) are not forwarded.
+- **Credential leakage in responses.** Airlock redacts injected credentials from proxied response headers, trailers and bodies, including SSE streams, independently of how the upstream chunks the response. On routes that inject a credential, upstream 1xx informational responses (such as `103 Early Hints`) are not forwarded. A credential that cannot be redacted safely is refused rather than forwarded — see [Credential Characters and Redaction](#credential-characters-and-redaction).
 - **Uncontrolled blast radius.** Per-route rate limiting and timeouts prevent a single agent from exhausting upstream API quotas or hanging indefinitely.
 
 ### Assumptions
@@ -43,6 +43,35 @@ This document covers Airlock's security model, threat model, path normalization,
 ## Injected Headers
 
 Before injecting credentials and `extra_headers`, Airlock removes the agent's `Connection` header, every header it names, and the standard hop-by-hop headers. Otherwise `Connection: Authorization` would make the proxy drop the injected credential. `auth.header` and `extra_headers` may not be hop-by-hop names.
+
+## Credential Characters and Redaction
+
+Airlock redacts an injected credential from response headers, trailers and
+bodies by replacing it with the literal `[REDACTED]`. Because the placeholder
+opens with `[` and closes with `]`, a credential that itself contains `[` or
+`]` can be re-formed by a replacement sitting next to the bytes around it. With
+a credential `]Z!` and an injected header value `XY]Z!`, an upstream body of
+`XYZ!` redacts to `[REDACTED]Z!` — which contains the credential again.
+
+**Airlock therefore refuses a request on a route whose resolved credential (or
+the injected header value built from `auth.prefix` plus the credential)
+contains `[` or `]`.** The request is answered `500` and the upstream is never
+contacted, so no response exists to leak. The log names the route and the
+reason; it never contains the credential value. Rotate the credential to a
+value without brackets, or drop the brackets from `auth.prefix`.
+
+A credential free of `[` and `]` cannot be re-formed this way: every span of a
+redacted response that overlaps a replacement without being contained in it
+includes the placeholder's `[` or `]`, so such a credential can only "appear"
+inside the constant placeholder text (a credential of `RED` is a substring of
+`[REDACTED]`, which reveals nothing about it). Bracket-free credentials are
+unaffected by this check.
+
+Redaction is also independent of how the upstream chunks its response. Both the
+plain and the SSE redactor hold back only the tail of the stream that could
+still begin a credential, and replace longest match first, so the bytes the
+agent receives are the same whatever the chunk boundaries are. An agent cannot
+reveal a fragment of a credential by influencing the response framing.
 
 ## MCP Request Inspection
 
@@ -135,7 +164,7 @@ Regex is for **matching only**. Capture groups are ignored — they do not feed 
 
 ## Fuzz Testing
 
-The access rule engine is covered by Go fuzz tests that throw millions of random inputs at the path matcher and access policy evaluator, looking for bypasses, panics, or unexpected matches:
+The access rule engine and the response redactors are covered by Go fuzz tests that throw millions of random inputs at the path matcher, the access policy evaluator and the redaction readers, looking for bypasses, panics, or unexpected matches:
 
 | Fuzz Target | What it tests |
 |---|---|
@@ -145,6 +174,8 @@ The access rule engine is covered by Go fuzz tests that throw millions of random
 | `FuzzAccessPolicyBypass` | Full ALLOW-only policy — only POST `/v1/chat/completions` should pass |
 | `FuzzAccessPolicyDenyBypass` | DENY rule bypass — DELETE must always be denied |
 | `FuzzMatchPatternNoPanic` | Arbitrary pattern + path combinations for panics |
+| `FuzzRedactStreaming` | Response body redaction — a secret must never survive, and streamed output must equal one-shot output for every chunking |
+| `FuzzRedactHeaderValues` | Response header redaction — same replacement result as bodies, no surviving secret |
 
 Run them yourself:
 
@@ -156,7 +187,7 @@ go test -fuzz=FuzzAccessPolicyBypass -fuzztime=10s ./internal/proxy/
 go test -fuzz=FuzzAccessPolicyBypass -fuzztime=5m ./internal/proxy/
 ```
 
-All six targets have been run for millions of executions each with zero bypasses or panics found.
+The six access rule targets have been run for millions of executions each with zero bypasses or panics found. The two redaction targets are run on every change to the redactors.
 
 ## HTTP Status Codes
 
@@ -166,5 +197,6 @@ All six targets have been run for millions of executions each with zero bypasses
 | `403` | Access rule or MCP tool policy denied the request |
 | `404` | No route matched the request path |
 | `429` | Rate limit exceeded |
+| `500` | A credential could not be injected, or contains `[`/`]` and cannot be redacted |
 | `502` | Upstream returned an error or is unreachable |
 | `504` | Request or idle timeout exceeded |
