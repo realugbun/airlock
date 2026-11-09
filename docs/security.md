@@ -106,7 +106,9 @@ Routes are matched in config order, first match wins. A config in which an earli
 
 ## Request Method
 
-Access rules authorize a method together with a path, so the method a request carries has to be the method the upstream performs. A request with `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` (any header-name case) is rejected with `400 Bad Request` before routing; a framework or upstream that honours one of those headers would otherwise run a method the rules never authorized. As with an ambiguous path, the request is refused rather than cleaned up, and only the header's name is logged.
+Access rules authorize a method together with a path, so Airlock forwards the request method it routed on and refuses the standard ways of asking an upstream to use a different one. A request with `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` (any header-name case) is rejected with `400 Bad Request` before routing; a framework or upstream that honours one of those headers would otherwise run a method the rules never authorized. As with an ambiguous path, the request is refused rather than cleaned up, and the header's value is never logged, only its name.
+
+This covers the three override headers, not every convention an upstream might invent. A framework that reads a method out of the request body or the query string (`?_method=DELETE`) sees whatever the agent sent: the query string and the body are forwarded unchanged, so the access rules cannot constrain them. Do not place a route in front of an upstream that honours such a parameter unless the rules allow that method anyway.
 
 ## Query Strings
 
@@ -120,7 +122,7 @@ Airlock matches against `r.URL.Path` (the percent-decoded request path) after `s
 
 - **Double slashes** (`//`) are normalized — interior empty segments are filtered, so `/v1//chat/completions` matches the same as `/v1/chat/completions`
 - **Encoded path separators** — requests whose escaped path contains `%2f` or `%5c` are rejected with `400 Bad Request`, preventing "policy sees path A, upstream sees path B" mismatches (checked via `RawPath` with `EscapedPath()` fallback)
-- **Path traversal** — requests whose decoded path contains a `.` or `..` segment (including `%2e` forms), or a literal backslash, are rejected with `400 Bad Request`, both before and after `strip_prefix` is applied. Airlock never cleans the path, since many upstreams would resolve `/allowed/../admin` to `/admin`
+- **Path traversal** — requests whose decoded path contains a `.` or `..` segment (including `%2e` forms), or a literal backslash, are rejected with `400 Bad Request`. Airlock never cleans the path, since many upstreams would resolve `/allowed/../admin` to `/admin`. The check runs before routing, and again after `strip_prefix` as a backstop; a path that only looks like it is under a route's prefix, such as `/api../admin` for an `/api` route, matches no route at all and gets `404 Not Found`
 - **Null bytes** (`%00`) are decoded but treated as literal characters — no truncation
 - **Case-sensitive** — `/V1/CHAT/COMPLETIONS` does not match `/v1/chat/completions`
 - **`*` matches exactly one non-empty segment** — it never matches empty strings

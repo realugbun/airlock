@@ -457,8 +457,11 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 	// The same helper the Director uses, so the path checked against the
 	// access policy is the path the upstream receives.
 	targetPath := stripRoutePrefix(r.URL.Path, route.StripPrefix)
-	// strip_prefix can expose a dot segment, e.g. "/api../x" with
-	// strip_prefix "/api" leaves "../x".
+	// Backstop. Routing and stripping both cut on a segment boundary, so
+	// targetPath's segments are a suffix of the segments already checked
+	// before routing and this cannot currently fire. It stays so that a
+	// future change to stripping fails closed rather than silently handing
+	// a dot segment to the policy.
 	if hasAmbiguousPath(targetPath) {
 		http.Error(w, "Bad Request: dot segments and backslashes not allowed in path", http.StatusBadRequest)
 		return
