@@ -1140,8 +1140,21 @@ func mcpFormalUninspectableRequests() []mcpFormalUninspectable {
 		{"duplicate name key", http.StatusBadRequest, func() *http.Request {
 			return mcpFormalPostJSON(`{"method":"tools/call","params":{"name":"admin_delete","Name":"calendar_read"}}`)
 		}},
-		{"unicode-escaped duplicate name key", http.StatusBadRequest, func() *http.Request {
+		{"repeated name key", http.StatusBadRequest, func() *http.Request {
 			return mcpFormalPostJSON(`{"method":"tools/call","params":{"name":"admin_delete","name":"calendar_read"}}`)
+		}},
+		{"escape-spelled duplicate name key", http.StatusBadRequest, func() *http.Request {
+			return mcpFormalPostJSON(`{"method":"tools/call","params":{"name":"admin_delete","\u006eame":"calendar_read"}}`)
+		}},
+		// Defect found in review: without this case, dropping
+		// decodeStrictObject's case check is caught only by the parser
+		// tests, not at the enforcement level where it decides whether a
+		// request is forwarded to a case-insensitive upstream.
+		{"case-variant method key", http.StatusBadRequest, func() *http.Request {
+			return mcpFormalPostJSON(`{"Method":"tools/call","params":{"name":"admin_delete"}}`)
+		}},
+		{"case-variant params key", http.StatusBadRequest, func() *http.Request {
+			return mcpFormalPostJSON(`{"method":"tools/call","Params":{"name":"admin_delete"}}`)
 		}},
 		{"non-object message", http.StatusBadRequest, func() *http.Request {
 			return mcpFormalPostJSON(`"tools/call"`)
@@ -1488,11 +1501,13 @@ func mcpFormalAmbiguousBodies() []string {
 		`{"method":"tools/call","Method":"ping","params":{"name":"a"}}`,
 		`{"method":"tools/call","params":{"name":"delete_all","Name":"read"}}`,
 		`{"method":"tools/call","params":{"Name":"read","name":"delete_all"}}`,
-		// unicode escapes that decode to a guarded key or a variant
-		`{"method":"tools/call","params":{"name":"a"},"method":"ping"}`,
-		`{"method":"tools/call","params":{"name":"a","name":"b"}}`,
-		`{"Method":"tools/call","params":{"name":"a"}}`,
-		`{"method":"tools/call","params":{"name":"a"},"params":{"name":"b"}}`,
+		// an escape-spelled guarded key colliding with its plain
+		// spelling, or decoding to a case variant
+		`{"\u006dethod":"tools/call","params":{"name":"a"},"method":"ping"}`,
+		`{"method":"tools/call","params":{"\u006eame":"a","name":"b"}}`,
+		`{"\u004Dethod":"tools/call","params":{"name":"a"}}`,
+		`{"method":"tools/call","para\u006ds":{"name":"a"},"params":{"name":"b"}}`,
+		`{"method":"tools/call","params":{"\u004Eame":"a"}}`,
 		// Unicode simple folding: U+017F folds to 's'
 		`{"method":"tools/call","param\u017f":{"name":"a"}}`,
 		"{\"method\":\"tools/call\",\"paramſ\":{\"name\":\"a\"}}",
@@ -1614,6 +1629,38 @@ func TestDecodeStrictObjectMatchesIndependentScanner(t *testing.T) {
 	for _, body := range bodies {
 		assert.Equal(t, json.Valid([]byte(body)), refValidJSON([]byte(body)),
 			"validity disagreement on %q", body)
+	}
+}
+
+// An escape-spelled key that does NOT collide with another spelling is
+// unambiguous: every JSON parser decodes "\u006eame" to "name", so
+// Airlock reads the tool name the upstream will execute. These are
+// accepted, and the name read must be the decoded one. Only a collision
+// between two spellings, or a decode to a case variant, is ambiguous.
+func TestEscapeSpelledKeysAreReadNotRejected(t *testing.T) {
+	cases := []struct {
+		body, method, tool string
+	}{
+		{`{"method":"tools/call","params":{"\u006eame":"admin_delete"}}`, "tools/call", "admin_delete"},
+		{`{"method":"tools/call","para\u006ds":{"name":"admin_delete"}}`, "tools/call", "admin_delete"},
+		{`{"m\u0065thod":"tools/call","params":{"name":"admin_delete"}}`, "tools/call", "admin_delete"},
+		{`{"method":"tools\/call","params":{"name":"admin_delete"}}`, "tools/call", "admin_delete"},
+		{`{"method":"\u0074ools/call","params":{"name":"\u0061dmin_delete"}}`, "tools/call", "admin_delete"},
+	}
+	p, err := NewMCPToolPolicy(&MCPToolPolicyConfig{DeniedTools: []string{"admin_*"}})
+	require.NoError(t, err)
+	for _, c := range cases {
+		msg, reason := parseRPCMessage([]byte(c.body))
+		require.Empty(t, reason, "body %s", c.body)
+		require.NotNil(t, msg)
+		assert.Equal(t, c.method, msg.method, "body %s", c.body)
+		assert.Equal(t, c.tool, msg.toolName, "body %s", c.body)
+
+		// And the decoded name is what the policy is applied to.
+		res, reason := p.checkSingle([]byte(c.body))
+		require.Empty(t, reason)
+		assert.True(t, res.Denied, "body %s must be denied by name %q", c.body, c.tool)
+		assert.Equal(t, c.tool, res.ToolName)
 	}
 }
 
@@ -1768,7 +1815,14 @@ func TestCheckRequestMatchesDafnyDecision(t *testing.T) {
 			var want refMCPDecision
 			switch {
 			case !p.hasToolRules():
+				// Dafny ObserveRequest: nothing is enforced. The method
+				// is still reported, for logging, when it can be read.
 				want = refMCPForward("")
+				if len(raw) > 0 && raw[0] != '[' {
+					if m := refParseRPCMessage(raw); !m.malformed {
+						want = refMCPForward(m.method)
+					}
+				}
 			case len(raw) == 0:
 				want = refMCPForward("")
 			case !utf8.Valid(raw):
@@ -1794,6 +1848,9 @@ func TestCheckRequestMatchesDafnyDecision(t *testing.T) {
 			assert.Equal(t, want.kind, got.kind, "policy %d, body %q", pi, body)
 			if want.kind == "deny" {
 				assert.Equal(t, want.toolName, got.toolName, "policy %d, body %q", pi, body)
+			}
+			if want.kind == "forward" {
+				assert.Equal(t, want.method, got.method, "policy %d, body %q", pi, body)
 			}
 		}
 	}

@@ -332,12 +332,26 @@ predicate IsToolCall(x: Parsed)
 
 // parseRPCMessage rejects a tools/call whose params.name is absent, not
 // a string, or empty, so a tools/call that reaches the decision always
-// carries a name. This is a property of the trusted parser, carried as
-// a precondition and checked against the shipped parser by
-// TestParseRPCMessageToolCallAlwaysNamesATool.
+// carries a name. That is a property of the trusted parser, checked
+// against the shipped one by TestParseRPCMessageToolCallAlwaysNamesATool.
+//
+// NO THEOREM BELOW NEEDS IT. They are stated without it, so they hold
+// for any parsed message, including one naming the empty tool -- which
+// is the right strength, because an empty name is just another name the
+// policy decides on. ParsedOK is kept only to say so explicitly.
 predicate ParsedOK(x: Parsed)
 {
   IsToolCall(x) ==> |x.toolName| > 0
+}
+
+// The theorems do not depend on it: the decision for a tools/call
+// naming the empty tool is the same function of the policy as for any
+// other name.
+lemma TheoremsDoNotNeedParsedOK(p: Policy, x: Parsed)
+  requires IsToolCall(x) && !ParsedOK(x)
+  ensures x.toolName == ""
+  ensures IsToolDenied(p, x.toolName) == IsToolDenied(p, "")
+{
 }
 
 // Go: MCPCheckResult plus *MCPRequestError.
@@ -535,15 +549,6 @@ function ToolCallsIn(b: Body): seq<string>
   case BatchBody(xs) => CallNames(xs)
 }
 
-predicate BodyParsedOK(b: Body)
-{
-  match b
-  case Uninspectable(_) => true
-  case Empty => true
-  case Single(x) => ParsedOK(x)
-  case BatchBody(xs) => forall i :: 0 <= i < |xs| ==> ParsedOK(xs[i])
-}
-
 lemma NoDeniedCallSplit(p: Policy, xs: seq<Parsed>)
   requires |xs| > 0
   ensures NoDeniedCall(p, xs) <==>
@@ -595,7 +600,6 @@ lemma CallNamesCharacterisation(p: Policy, xs: seq<Parsed>)
 
 method EnforceRequest(p: Policy, b: Body) returns (d: Decision)
   requires HasToolRules(p)
-  requires BodyParsedOK(b)
 
   // --- M3 FAIL CLOSED ----------------------------------------------
   //
@@ -667,7 +671,6 @@ method ObserveRequest(p: Policy, b: Body) returns (d: Decision)
 // ---------------------------------------------------------------------
 
 method CheckRequest(p: Policy, isPost: bool, b: Body) returns (d: Decision)
-  requires BodyParsedOK(b)
 
   // --- M3 FAIL CLOSED, at the entry point --------------------------
   ensures HasToolRules(p) && isPost && !Inspectable(b) ==> d.Reject?
@@ -713,7 +716,6 @@ method CheckRequest(p: Policy, isPost: bool, b: Body) returns (d: Decision)
 method MCPRequestContract(p: Policy, b: Body) returns (d: Decision)
   requires WellFormed(p)
   requires HasToolRules(p)
-  requires BodyParsedOK(b)
   ensures !Inspectable(b) ==> !Forwarded(d)
   ensures Forwarded(d) ==>
           forall n :: n in ToolCallsIn(b) ==> IsToolAllowed(p, n)
@@ -942,7 +944,6 @@ method ToolsListRequestIsForwarded(p: Policy, id: string) returns (d: Decision)
 method HiddenToolsCannotBeCalled(p: Policy, names: seq<string>, i: int, id: string)
   returns (d: Decision)
   requires 0 <= i < |names|
-  requires |names[i]| > 0
   requires names[i] !in FilterNames(p, names)
   // a tool the listing hides is refused when called, by name and id
   ensures d == DenyTool(names[i], id)
@@ -955,7 +956,6 @@ method HiddenToolsCannotBeCalled(p: Policy, names: seq<string>, i: int, id: stri
 method ListedToolsCanBeCalled(p: Policy, names: seq<string>, i: int, id: string)
   returns (d: Decision)
   requires 0 <= i < |names|
-  requires |names[i]| > 0
   requires names[i] in FilterNames(p, names)
   // and a tool the listing keeps is forwarded when called
   ensures d == Forward(ToolsCall)
@@ -973,7 +973,6 @@ method MCPToolContract(p: Policy, names: seq<string>, i: int, id: string)
   returns (listed: seq<string>, d: Decision)
   requires WellFormed(p)
   requires 0 <= i < |names|
-  requires |names[i]| > 0
   ensures listed == FilterNames(p, names)
   ensures forall n :: n in listed ==> IsToolAllowed(p, n)
   ensures d == (if IsToolAllowed(p, names[i])
