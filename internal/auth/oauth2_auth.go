@@ -49,12 +49,38 @@ type OAuth2Auth struct {
 	expiry      time.Time
 }
 
+// noRedirectClient returns the client to use for token requests, with
+// redirect following disabled.
+//
+// The token request carries the refresh token and the client credentials in
+// its form body. net/http follows up to 10 redirects by default and, on a 307
+// or 308, replays the body against the redirect target, so a token endpoint
+// that answers 3xx (or an attacker able to influence its response) would hand
+// those credentials to another host. ErrUseLastResponse makes Do return the
+// 3xx response itself instead, which refresh then rejects on its non-200 path:
+// a redirect is a refresh failure, and no proxied request is forwarded with a
+// credential.
+//
+// A caller-supplied client is copied rather than mutated, so setting
+// CheckRedirect here cannot change the behaviour of a client the caller also
+// uses elsewhere. The copy shares the original's Transport, so connection
+// pooling is unaffected.
+func noRedirectClient(base *http.Client) *http.Client {
+	var client http.Client
+	if base != nil {
+		client = *base
+	} else {
+		client.Timeout = 30 * time.Second
+	}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &client
+}
+
 // NewOAuth2Auth creates an OAuth2 auth provider.
 func NewOAuth2Auth(registry *secrets.Registry, cfg OAuth2AuthConfig) *OAuth2Auth {
-	client := cfg.HTTPClient
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
+	client := noRedirectClient(cfg.HTTPClient)
 	return &OAuth2Auth{
 		registry:     registry,
 		clientIDRef:  cfg.ClientID,
@@ -138,7 +164,13 @@ func (o *OAuth2Auth) refresh(ctx context.Context) (string, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	// Redirects are not followed, so a 3xx arrives here as a non-200 and is
+	// reported as a refresh failure. The form body is never sent anywhere
+	// but o.tokenURL.
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			return "", fmt.Errorf("token endpoint returned %d: redirects are not followed", resp.StatusCode)
+		}
 		return "", fmt.Errorf("token endpoint returned %d", resp.StatusCode)
 	}
 
