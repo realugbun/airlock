@@ -35,7 +35,7 @@ providers:
 
 # ─── Routes ───
 routes:
-  - path_prefix: "/openai"           # Match requests starting with this
+  - path_prefix: "/openai"           # Match requests under this prefix (whole segments)
     upstream: "https://api.openai.com" # Forward to this URL
     strip_prefix: "/openai"           # Remove this prefix before forwarding
     timeout: "300s"                    # Total request timeout (default 300s, 0 to disable)
@@ -77,6 +77,74 @@ routes:
         - send_message
         - "*_delete"                  # Glob: block all tools ending in _delete
 ```
+
+## Route Matching
+
+Routes are matched against the request path in the order they appear in the
+config. First match wins.
+
+A `path_prefix` matches **whole path segments**: a request matches when its
+path equals the prefix or continues it after a `/`. So a route with
+`path_prefix: /git` serves `/git`, `/git/` and `/git/myorg/repo.git`, and does
+**not** serve `/github/repos` or `/gitlab`. A trailing slash on the prefix is
+normalized, so `/git` and `/git/` describe the same route, and a prefix of `/`
+matches every path.
+
+`strip_prefix` is removed on the same boundary, and a request for exactly the
+prefix forwards `/` upstream:
+
+| `path_prefix` | `strip_prefix` | Agent request | Upstream path |
+|---|---|---|---|
+| `/api` | `/api` | `/api/v1/users` | `/v1/users` |
+| `/api` | `/api` | `/api` | `/` |
+| `/api/` | `/api/` | `/api/v1/users` | `/v1/users` |
+| `/api` | `/api` | `/apifoo/v1` | no route, `404` |
+
+The path that access rules are checked against is the path the upstream
+receives, after `strip_prefix` is applied.
+
+### Shadowed routes are rejected at load
+
+Because the first match wins, a route whose prefix is already covered by an
+earlier route can never serve a request — its upstream, credential and access
+rules would silently never apply. Airlock rejects such a config, at startup and
+on `SIGHUP` reload, with an error naming both routes:
+
+```yaml
+routes:
+  - path_prefix: "/api"       # matches /api/v2/... as well
+  - path_prefix: "/api/v2"    # can never match
+```
+
+```
+validating config: route 1 (/api/v2) can never match: route 0 (/api) is listed
+first and already matches every path under "/api/v2"; list the more specific
+route first
+```
+
+Order the more specific prefix first (`/api/v2` before `/api`) and both routes
+work. Two routes with the same prefix are rejected for the same reason, and a
+`/` catch-all is only valid as the **last** route. Prefixes that merely share
+text, such as `/git` and `/github`, are independent in either order.
+
+If a reload is rejected, the previously loaded routes stay active.
+
+### Query strings
+
+A query string is forwarded to the upstream byte for byte. It is not part of
+route matching and it is not part of access rules — rules match on the path
+only, so `path: /v1/users` matches `/v1/users?role=admin` too. Do not rely on
+access rules to constrain query parameters.
+
+### Method override headers are rejected
+
+Access rules authorize a method together with a path, so the method must be
+unambiguous. A request carrying `X-HTTP-Method-Override`, `X-HTTP-Method` or
+`X-Method-Override` (in any header-name case) is rejected with
+`400 Bad Request` before routing, since a framework or upstream that honoured
+the header would perform a different method than the one that was authorized.
+Airlock refuses such a request rather than stripping the header, the same way
+it refuses an ambiguous path rather than cleaning it.
 
 ## Secret Providers
 
@@ -360,6 +428,6 @@ kill -HUP $(pidof airlock)
 docker kill --signal=HUP <container>
 ```
 
-- Routes are swapped atomically — in-flight requests complete on the old config
-- If the new config is invalid, the old config stays active and an error is logged
+- Routes are swapped atomically — in-flight requests complete on the old config, and every request is served entirely by one config snapshot: the upstream it reaches and the credential it carries always come from the same config
+- If the new config is invalid — including a route shadowed by an earlier one — the old routes stay active and an error is logged
 - Secret providers are **not** re-initialized on reload (only routes and access rules)

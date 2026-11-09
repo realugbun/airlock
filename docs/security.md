@@ -96,6 +96,24 @@ On a route whose `mcp_rules` lists `allowed_tools` or `denied_tools`, a POST bod
 - The listener allows 10s to read request headers, 1 MiB of headers, and closes idle keep-alive connections after 120s. There is no server-wide read or write timeout, so SSE streams are bounded only by the route's `timeout` and `idle_timeout`
 - A non-streaming `tools/list` response is buffered to filter it and capped at 10 MiB; a larger response gets `502 Bad Gateway`
 
+## Route Matching
+
+A route's `path_prefix` matches **whole path segments**: a path matches when it equals the prefix or continues it after a `/`. A `/git` route serves `/git` and `/git/org/repo` and does not serve `/github/repos`, so a request cannot be pulled onto a route whose credential and access rules were written for a different API. A trailing slash on the prefix is normalized; a `/` prefix matches every path.
+
+`strip_prefix` is removed on the same boundary, so the path checked against the access rules is the path the upstream receives.
+
+Routes are matched in config order, first match wins. A config in which an earlier route's prefix equals or covers a later route's is rejected at load — at startup and on `SIGHUP` reload — with an error naming both routes, because the later route's rules, credential and upstream could never apply. A `/` catch-all is valid only as the last route. A rejected reload leaves the previously loaded routes active, and every request is served entirely by one config snapshot: the upstream it reaches and the credential it carries always come from the same config.
+
+## Request Method
+
+Access rules authorize a method together with a path, so Airlock forwards the request method it routed on and refuses the standard ways of asking an upstream to use a different one. A request with `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` (any header-name case) is rejected with `400 Bad Request` before routing; a framework or upstream that honours one of those headers would otherwise run a method the rules never authorized. As with an ambiguous path, the request is refused rather than cleaned up, and the header's value is never logged, only its name.
+
+This covers the three override headers, not every convention an upstream might invent. A framework that reads a method out of the request body or the query string (`?_method=DELETE`) sees whatever the agent sent: the query string and the body are forwarded unchanged, so the access rules cannot constrain them. Do not place a route in front of an upstream that honours such a parameter unless the rules allow that method anyway.
+
+## Query Strings
+
+The query string is forwarded to the upstream unchanged, including its percent-encoding. It takes no part in route matching and no part in access rules: rules match on the path only, so `path: /v1/users` matches `/v1/users?role=admin` as well. Access rules cannot constrain query parameters.
+
 ## Path Normalization
 
 Airlock matches against `r.URL.Path` (the percent-decoded request path) after `strip_prefix` is applied. Matching is **segment-based** — paths are split on `/` and compared segment by segment.
@@ -104,7 +122,7 @@ Airlock matches against `r.URL.Path` (the percent-decoded request path) after `s
 
 - **Double slashes** (`//`) are normalized — interior empty segments are filtered, so `/v1//chat/completions` matches the same as `/v1/chat/completions`
 - **Encoded path separators** — requests whose escaped path contains `%2f` or `%5c` are rejected with `400 Bad Request`, preventing "policy sees path A, upstream sees path B" mismatches (checked via `RawPath` with `EscapedPath()` fallback)
-- **Path traversal** — requests whose decoded path contains a `.` or `..` segment (including `%2e` forms), or a literal backslash, are rejected with `400 Bad Request`, both before and after `strip_prefix` is applied. Airlock never cleans the path, since many upstreams would resolve `/allowed/../admin` to `/admin`
+- **Path traversal** — requests whose decoded path contains a `.` or `..` segment (including `%2e` forms), or a literal backslash, are rejected with `400 Bad Request`. Airlock never cleans the path, since many upstreams would resolve `/allowed/../admin` to `/admin`. The check runs before routing, and again after `strip_prefix` as a backstop; a path that only looks like it is under a route's prefix, such as `/api../admin` for an `/api` route, matches no route at all and gets `404 Not Found`
 - **Null bytes** (`%00`) are decoded but treated as literal characters — no truncation
 - **Case-sensitive** — `/V1/CHAT/COMPLETIONS` does not match `/v1/chat/completions`
 - **`*` matches exactly one non-empty segment** — it never matches empty strings
@@ -275,7 +293,7 @@ running binary:
 
 | Code | Meaning |
 |---|---|
-| `400` | Encoded path separator (`%2f`/`%5c`) in request |
+| `400` | Encoded path separator (`%2f`/`%5c`), `.`/`..` segment or backslash in the path, or a method override header in the request |
 | `403` | Access rule or MCP tool policy denied the request |
 | `404` | No route matched the request path |
 | `429` | Rate limit exceeded |

@@ -176,10 +176,7 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 			req.URL.Host = upstream.Host
 			req.Host = upstream.Host
 			if stripPrefix != "" {
-				req.URL.Path = strings.TrimPrefix(req.URL.Path, stripPrefix)
-				if req.URL.Path == "" {
-					req.URL.Path = "/"
-				}
+				req.URL.Path = stripRoutePrefix(req.URL.Path, stripPrefix)
 			}
 		},
 		Transport: baseTransport,
@@ -323,6 +320,22 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject method override headers rather than stripping them. The access
+	// policy authorizes the request method; a framework or upstream that
+	// honours one of these headers would then perform a different method
+	// than the one that was checked. Like an ambiguous path, an ambiguous
+	// method is refused, not cleaned up.
+	if name := methodOverrideHeader(r.Header); name != "" {
+		rt.logger.Warn("rejected request with method override header",
+			"header", name,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"remote", r.RemoteAddr,
+		)
+		http.Error(w, "Bad Request: method override headers not allowed", http.StatusBadRequest)
+		return
+	}
+
 	// Reject encoded path separators (%2f, %5c) to prevent interpretation
 	// mismatches between the policy (which sees decoded r.URL.Path) and
 	// upstreams (which may interpret the raw encoding differently).
@@ -356,6 +369,30 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rt.handleRoute(route, w, r)
+}
+
+// methodOverrideHeaders are headers that some frameworks and upstreams honour
+// in place of the request method. Airlock authorizes the method it routes on,
+// so a request carrying one of these is rejected instead of forwarded.
+var methodOverrideHeaders = []string{
+	"X-HTTP-Method-Override",
+	"X-HTTP-Method",
+	"X-Method-Override",
+}
+
+// methodOverrideHeader returns the name of the first method override header
+// present, matched without regard to case, or "" if there is none. Go
+// canonicalises header names on parsed requests; the explicit comparison also
+// covers headers set directly on the map.
+func methodOverrideHeader(h http.Header) string {
+	for name := range h {
+		for _, override := range methodOverrideHeaders {
+			if strings.EqualFold(name, override) {
+				return override
+			}
+		}
+	}
+	return ""
 }
 
 // containsEncodedPathSep checks for %2f or %5c (case-insensitive) in encoded paths.
@@ -393,7 +430,7 @@ func (rt *Router) matchRoute(path string) *Route {
 	rt.mu.RUnlock()
 
 	for _, route := range routes {
-		if strings.HasPrefix(path, route.PathPrefix) {
+		if PathPrefixMatches(route.PathPrefix, path) {
 			return route
 		}
 	}
@@ -417,12 +454,14 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	targetPath := strings.TrimPrefix(r.URL.Path, route.StripPrefix)
-	if targetPath == "" {
-		targetPath = "/"
-	}
-	// strip_prefix can expose a dot segment, e.g. "/api../x" with
-	// strip_prefix "/api" leaves "../x".
+	// The same helper the Director uses, so the path checked against the
+	// access policy is the path the upstream receives.
+	targetPath := stripRoutePrefix(r.URL.Path, route.StripPrefix)
+	// Backstop. Routing and stripping both cut on a segment boundary, so
+	// targetPath's segments are a suffix of the segments already checked
+	// before routing and this cannot currently fire. It stays so that a
+	// future change to stripping fails closed rather than silently handing
+	// a dot segment to the policy.
 	if hasAmbiguousPath(targetPath) {
 		http.Error(w, "Bad Request: dot segments and backslashes not allowed in path", http.StatusBadRequest)
 		return

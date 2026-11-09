@@ -138,6 +138,16 @@ routes:
 | `GET /openai/v1/models` | `/openai` | `GET https://api.openai.com/v1/models` |
 | `GET /github/repos/org/repo` | `/github` | `GET https://api.github.com/repos/org/repo` |
 | `GET /unknown/path` | none | `404 Not Found` |
+| `GET /openai` | `/openai` | `GET https://api.openai.com/` |
+| `GET /openai-staging/v1/models` | none | `404 Not Found` |
+
+A prefix matches whole path segments: a path matches when it equals the prefix
+or continues it after a `/`. A `/git` route therefore does not capture
+`/github/repos`. A trailing slash on the prefix makes no difference, and a
+`/` prefix matches everything.
+
+Query strings are forwarded unchanged and are not part of route matching or
+access rules.
 
 Configure your agent by setting the base URL for each SDK:
 
@@ -152,7 +162,10 @@ client = Anthropic(base_url="http://airlock:8080/anthropic")
 requests.get("http://airlock:8080/github/repos/myorg/myrepo")
 ```
 
-Routes are matched in order — first match wins. Put more specific prefixes before broader ones.
+Routes are matched in order — first match wins, so more specific prefixes go
+first. If an earlier route's prefix would swallow a later one (`/api` listed
+before `/api/v2`, or a `/` catch-all that is not last), the later route could
+never match, and Airlock refuses to start with an error naming both routes.
 
 ## Access Rules
 
