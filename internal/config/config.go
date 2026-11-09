@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/realugbun/airlock/internal/proxy"
 	"github.com/realugbun/airlock/pkg/secrets"
 	"gopkg.in/yaml.v3"
 )
@@ -314,6 +315,28 @@ func (c *Config) validate() error {
 		}
 	}
 
+	if err := c.checkRouteShadowing(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// checkRouteShadowing rejects a config in which an earlier route's path_prefix
+// swallows a later one. Routes are matched in order, first match wins, so the
+// later route could never serve a request and its access rules, credential and
+// upstream would silently never apply. Reordering the routes fixes it; a
+// catch-all "/" route is only valid as the last route.
+func (c *Config) checkRouteShadowing() error {
+	for i, earlier := range c.Routes {
+		for j := i + 1; j < len(c.Routes); j++ {
+			later := c.Routes[j]
+			if proxy.PathPrefixShadows(earlier.PathPrefix, later.PathPrefix) {
+				return fmt.Errorf("route %d (%s) can never match: route %d (%s) is listed first and already matches every path under %q; list the more specific route first",
+					j, later.PathPrefix, i, earlier.PathPrefix, later.PathPrefix)
+			}
+		}
+	}
 	return nil
 }
 
