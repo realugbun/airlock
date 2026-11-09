@@ -64,9 +64,23 @@ value without brackets, or drop the brackets from `auth.prefix`.
 A credential free of `[` and `]` cannot be re-formed this way: every span of a
 redacted response that overlaps a replacement without being contained in it
 includes the placeholder's `[` or `]`, so such a credential can only "appear"
-inside the constant placeholder text (a credential of `RED` is a substring of
-`[REDACTED]`, which reveals nothing about it). Bracket-free credentials are
-unaffected by this check.
+inside the constant placeholder text.
+
+That leaves one edge case, which is refused on the same path: **a credential
+that is itself a substring of the literal text `[REDACTED]`** — `RED`,
+`ACTED`, `DAC`, the whole placeholder, or the empty string. Such a credential
+appears verbatim in any redacted response that contains a replacement at all.
+The appearance carries no information about the credential, because the bytes
+come from a constant rather than from the upstream, but the guarantee "no
+injected credential appears in the response" would be false as stated. Airlock
+refuses the request instead of shipping the guarantee with a caveat: the
+request is answered `500`, the upstream is never contacted, and the log names
+the route and the reason but never the value. Bracket-free credentials of four
+characters or more are unaffected unless they are a run of `REDACTED`.
+
+Together the two conditions are exactly the precondition of the redaction
+proofs, and that they are is itself proved — see
+[Machine-Checked Proofs](#machine-checked-proofs).
 
 Redaction is also independent of how the upstream chunks its response. Both the
 plain and the SSE redactor hold back only the tail of the stream that could
@@ -74,11 +88,11 @@ still begin a credential, and replace longest match first, so the bytes the
 agent receives are the same whatever the chunk boundaries are. An agent cannot
 reveal a fragment of a credential by influencing the response framing.
 
-Both of these properties — that no bracket-free credential survives redaction,
-and that the output does not depend on the chunk boundaries — are proved
-mechanically. See [Machine-Checked Proofs](#machine-checked-proofs), which also
-states the one part of the credential constraint that `redactionSafe` does not
-enforce.
+Both of these properties — that no credential Airlock accepts survives
+redaction, and that the output does not depend on the chunk boundaries — are
+proved mechanically, as is the fact that `redactionSafe` enforces the whole
+credential constraint the first proof needs. See
+[Machine-Checked Proofs](#machine-checked-proofs).
 
 ## MCP Request Inspection
 
@@ -204,7 +218,7 @@ verified in CI by [`.github/workflows/formal.yml`](../.github/workflows/formal.y
 which installs a pinned, SHA-256-checked Dafny 4.11.0 and runs
 `dafny verify --verification-time-limit 60` over every file. Warnings are
 errors, so a file that verifies with a warning still fails the job. The whole
-suite is 248 proof obligations and takes about 20 seconds.
+suite is 259 proof obligations and takes about 20 seconds.
 
 Nothing in `formal/` is axiomatised and nothing is assumed away inside a proof:
 CI rejects the build if `{:axiom}` or an `assume` statement appears anywhere
@@ -237,7 +251,7 @@ The glob matcher:
 - **Collapsing consecutive `**` does not change what matches.** `collapseDoublestar` is an optimisation against exponential branching; it is proved to accept exactly the same language.
 - **The whole `matchPattern` composition** — `splitPath`, then `collapseDoublestar`, then the DP — equals the declarative semantics of the *uncollapsed* pattern under the caps.
 
-Redaction, under the credential constraint stated below:
+Redaction, for every credential `redactionSafe` accepts:
 
 - **A bracket-free secret cannot overlap the placeholder.** It contains no `[REDACTED]`, has no suffix that is a placeholder prefix, and no prefix that is a placeholder suffix — so a replacement cannot splice the secret back together across its own boundary.
 - **One pass removes every occurrence of its secret and creates none.**
@@ -245,6 +259,7 @@ Redaction, under the credential constraint stated below:
 - **No secret appears in the output of `redactAll`,** for any number of secrets in any order.
 - **Streamed redaction equals one-shot redaction, for every chunking.** The chunk list is universally quantified, so this covers every way the upstream could split the body, including splitting a secret byte by byte across reads. Two different chunkings of the same body give byte-identical output.
 - **No secret appears in the streamed output, for every chunking** — the previous two results composed.
+- **The credential constraint those results need is enforced by `redactionSafe`, not assumed.** The theorems above have one hypothesis, `RedactableTok`: the secret is nonempty, contains no `[` or `]`, and is not a substring of `[REDACTED]`. The model of the shipped `redactionSafe` is proved to imply it for every secret it accepts (`RedactionSafeImpliesRedactable` in `formal/redact.dfy`), so the whole-buffer and streaming guarantees hold with `redactionSafe` as their only hypothesis (`NoSecretSurvivesTheShippedCheck`, `NoStreamedSecretSurvivesTheShippedCheck`). The converse is proved too, so the check refuses no credential the theorems could have covered.
 
 ### No rules means no restrictions
 
@@ -262,7 +277,7 @@ running binary:
 
 - **The models are hand-written transliterations of the Go, not generated from it.** No `dafny translate` output ships. The link is `internal/proxy/formal_diff_test.go`, which compares the shipped `splitPath`, `collapseDoublestar`, `matchSegment`, `matchPattern`, `AccessPolicy.Allowed`, `redactAll`, `tokenPrefixSuffixLen` and `streamRedactor` against hand-written Go reference implementations that mirror each Dafny definition line for line, over edge cases plus seeded pseudo-random input. It runs under `go test -race ./...`. A change to either side that breaks the correspondence fails that test, but the correspondence is checked by testing, not proved.
 - **`splitPath`'s use of the standard library is discharged by test, not proof.** The model splits on every `/` and drops empty pieces; the shipped code calls `strings.Trim` then `strings.Split` then filters. These are equal because `Trim` only removes leading and trailing `/`, each of which contributes an empty piece that the filter drops — an argument about the standard library, checked by `TestSplitPathMatchesDafnySplitPath`.
-- **The credential constraint includes one condition `redactionSafe` does not enforce.** The redaction theorems assume a secret is nonempty, free of `[` and `]`, **and not itself a substring of the literal text `[REDACTED]`**. `redactionSafe` enforces the brackets; it does not reject a credential like `RED` or `ACTED`. Such a credential does "appear" in redacted output, but only as part of the constant placeholder text, which carries no information about it. This is the same argument made in [Credential Characters and Redaction](#credential-characters-and-redaction), and it is an argument, not a theorem.
+- **`redactionSafe`'s use of the standard library is discharged by test, not proof.** The model of the check is `!ContainsAnyMeta(s) && !Occurs(PH, s)`; the shipped code calls `strings.ContainsAny(s, "[]")` then `strings.Contains("[REDACTED]", s)`. That these agree — including that `strings.Contains(x, "")` is true, which is what rejects the empty credential — is an argument about the standard library, checked by `TestRedactionSafeMatchesDafnyRedactionSafe` and `TestRedactionSafeDischargesRedactableTok`. The credential constraint itself is no longer assumed: see the last bullet under [What is proved](#what-is-proved).
 - **`path_regex` semantics are not modelled.** The per-rule matcher is uninterpreted, which is why first-match-wins, implicit deny and the segment cap cover regex rules too. But RE2's own behaviour, the `\A(?:...)\z` anchoring wrapper, and `normalizePath` are outside the models. The anchoring argument is in [Regex Path Matching](#regex-path-matching-path_regex) and is covered by tests and fuzzing, not proofs.
 - **The reader plumbing is not modelled.** The proofs cover the redaction algebra: the cascade receives some partition of its input followed by exactly one flush. That both shipped readers do deliver such a partition — `redactingReader` pushing `buf[:n]` per `Read` and flushing once when the upstream ends, `sseEventReader` calling the transform per event batch and the final hook once in `drain()` — is read off the code, not proved. Buffering, error ordering and `Close` behaviour are covered by tests only.
 - **SSE line-ending normalization happens before redaction.** `\r\n` and lone `\r` become `\n` on the way into the cascade, so the streaming guarantee is about the normalized byte stream, which is what the agent receives.
@@ -279,6 +294,6 @@ running binary:
 | `403` | Access rule or MCP tool policy denied the request |
 | `404` | No route matched the request path |
 | `429` | Rate limit exceeded |
-| `500` | A credential could not be injected, or contains `[`/`]` and cannot be redacted |
+| `500` | A credential could not be injected (including a failed OAuth2 refresh), or cannot be redacted because it contains `[`/`]` or is a substring of `[REDACTED]` |
 | `502` | Upstream returned an error or is unreachable |
 | `504` | Request or idle timeout exceeded |

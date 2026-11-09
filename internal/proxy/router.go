@@ -546,9 +546,11 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 
 	// Redaction replaces a credential with "[REDACTED]". A credential that
 	// itself contains '[' or ']' can combine with the bytes next to a
-	// replacement and spell the credential again, so such a credential cannot
-	// be redacted from a response. Refuse the request instead of forwarding
-	// it: the upstream is never contacted, so nothing can come back to leak.
+	// replacement and spell the credential again, and a credential that is a
+	// substring of "[REDACTED]" appears in the placeholder itself, so neither
+	// can be redacted from a response. Refuse the request instead of
+	// forwarding it: the upstream is never contacted, so nothing can come back
+	// to leak.
 	if !redactionSafe(redactValues) {
 		if rl != nil {
 			rl.Message = "credential cannot be redacted"
@@ -556,7 +558,7 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 		rt.logger.Error("refusing request: credential cannot be redacted",
 			"correlation_id", correlationID,
 			"route", route.PathPrefix,
-			"reason", "credential contains '[' or ']', which the [REDACTED] placeholder can recreate",
+			"reason", "credential contains '[' or ']', or is a substring of the [REDACTED] placeholder",
 		)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
