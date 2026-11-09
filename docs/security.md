@@ -13,7 +13,7 @@ This document covers Airlock's security model, threat model, path normalization,
 
 ### Assumptions
 
-- **Network isolation is enforced.** Airlock assumes the agent cannot bypass it to reach external APIs directly. This requires Docker `internal: true` networks, Kubernetes NetworkPolicy, or equivalent network controls. Without isolation, the agent can simply call APIs directly.
+- **Network isolation is enforced.** Airlock assumes the agent cannot bypass it to reach external APIs directly. This requires Docker `internal: true` networks, Kubernetes NetworkPolicy, or equivalent network controls. Without isolation, the agent can simply call APIs directly. **A NetworkPolicy cannot provide this isolation when the agent and Airlock are containers in the same pod** — see [Same-Pod Deployment and Egress Isolation](#same-pod-deployment-and-egress-isolation).
 - **Upstream credentials are appropriately scoped.** Airlock controls which endpoints the agent can reach, but it cannot limit what the upstream API does with a valid request. Use the narrowest API scopes and permissions possible.
 - **One Airlock per agent.** The sidecar model is the default security boundary. If multiple agents share one Airlock instance, Airlock cannot distinguish between them for authorization purposes unless they are separated at deployment time.
 - **The host and container runtime are trusted.** Airlock does not defend against a compromised container runtime, kernel exploits, or host-level access.
@@ -31,8 +31,8 @@ This document covers Airlock's security model, threat model, path normalization,
 ## Production Checklist
 
 - [ ] Every route has `access_rules` — strict mode (default) enforces this at startup
-- [ ] Bind to loopback in same-pod mode: `listen: "127.0.0.1:8080"`
-- [ ] Network isolation: Docker `internal: true` network or K8s NetworkPolicy
+- [ ] Bind to loopback in same-pod mode: `listen: "127.0.0.1:8080"` — and note that a NetworkPolicy cannot isolate the agent's egress in that mode, see [Same-Pod Deployment and Egress Isolation](#same-pod-deployment-and-egress-isolation)
+- [ ] Network isolation: Docker `internal: true` network, or a K8s NetworkPolicy on a **separate** agent pod
 - [ ] Enable telemetry: set `telemetry.endpoint` for OTel traces and metrics
 - [ ] Set timeouts: `timeout` and `idle_timeout` on every route
 - [ ] Set rate limits: `rate_limit` on routes exposed to agents
@@ -43,6 +43,49 @@ This document covers Airlock's security model, threat model, path normalization,
 ## Injected Headers
 
 Before injecting credentials and `extra_headers`, Airlock removes the agent's `Connection` header, every header it names, and the standard hop-by-hop headers. Otherwise `Connection: Authorization` would make the proxy drop the injected credential. `auth.header` and `extra_headers` may not be hop-by-hop names.
+
+## Same-Pod Deployment and Egress Isolation
+
+Running Airlock as a second container in the agent's pod and binding it to
+`127.0.0.1:8080` is a convenient way to make the gateway reachable only by that
+agent. It controls *ingress* to Airlock. **It does not control the agent's
+egress, and a Kubernetes NetworkPolicy cannot make it do so.**
+
+Every container in a pod shares one network namespace. They share the pod's IP,
+its loopback interface and its routing table, and a NetworkPolicy selects
+*pods*, not containers. So a NetworkPolicy's `egress` rules apply to the pod as
+a whole: whatever the policy must permit for Airlock to reach its upstreams, the
+agent container can use directly. The two containers are indistinguishable to
+the policy engine, and to anything else that makes decisions from the source IP.
+
+Concretely, in same-pod mode:
+
+- An egress rule allowing `443/TCP` to the internet so Airlock can call the
+  upstream API lets the agent call that API itself, with its own credential if
+  it has one, bypassing access rules, MCP filtering and rate limits.
+- Binding Airlock to loopback does not help. It stops *other* pods reaching the
+  gateway; the agent was never going through the network to reach it.
+- Dropping the agent's `NET_RAW`, running it as non-root, or setting
+  `dnsPolicy: None` do not change this. They raise the cost of discovering a
+  destination, not the ability to reach a permitted one.
+
+Use one of these instead:
+
+- **A separate gateway pod with a NetworkPolicy on the agent pod.** This is the
+  arrangement [deploy/helm](deployment.md#kubernetes-helm) ships and the
+  [Agent NetworkPolicy](deployment.md#agent-networkpolicy) example configures:
+  the agent pod's only permitted egress is DNS plus the gateway Service, and the
+  gateway pod is the only thing with egress to the internet. Because they are
+  different pods they have different IPs, so the policy can tell them apart.
+- **An egress control that distinguishes containers rather than pods** — an
+  authenticating egress proxy the agent has no credential for, a service mesh
+  sidecar with per-workload identity, or host or cloud firewall rules keyed on
+  something finer-grained than the pod IP.
+
+Same-pod mode is still reasonable when the agent container is trusted not to
+make its own outbound calls and Airlock is there for credential injection,
+auditing and rate limiting rather than as a containment boundary. It is not a
+substitute for network isolation.
 
 ## Credential Characters and Redaction
 
