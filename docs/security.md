@@ -74,6 +74,12 @@ still begin a credential, and replace longest match first, so the bytes the
 agent receives are the same whatever the chunk boundaries are. An agent cannot
 reveal a fragment of a credential by influencing the response framing.
 
+Both of these properties — that no bracket-free credential survives redaction,
+and that the output does not depend on the chunk boundaries — are proved
+mechanically. See [Machine-Checked Proofs](#machine-checked-proofs), which also
+states the one part of the credential constraint that `redactionSafe` does not
+enforce.
+
 ## MCP Request Inspection
 
 On a route whose `mcp_rules` lists `allowed_tools` or `denied_tools`, a POST body that Airlock cannot inspect exactly as the upstream will read it is rejected, never forwarded:
@@ -102,7 +108,7 @@ Airlock matches against `r.URL.Path` (the percent-decoded request path) after `s
 - **Null bytes** (`%00`) are decoded but treated as literal characters — no truncation
 - **Case-sensitive** — `/V1/CHAT/COMPLETIONS` does not match `/v1/chat/completions`
 - **`*` matches exactly one non-empty segment** — it never matches empty strings
-- **Safety caps** — patterns exceeding 64 segments or paths exceeding 256 segments are denied automatically. These limits are not configurable
+- **Safety caps** — patterns exceeding 64 segments or paths exceeding 256 segments are denied automatically. These limits are not configurable. The 256-segment path cap is enforced once for the whole request, before any rule is consulted: the glob matcher denies an over-cap path but a `path_regex` rule has no such cap, so without a central check a path long enough to fail a trailing `DENY /**` could be picked up by a later `ALLOW path_regex` and fail open. That the cap is consulted before any rule is [proved](#machine-checked-proofs)
 
 **Pattern matching** uses an iterative dynamic programming algorithm with O(P×S) worst-case time complexity, where P is the number of pattern segments and S is the number of path segments. There is no recursive backtracking — pathological patterns like `**/*/**/*/**/end` complete in bounded time.
 
@@ -132,7 +138,7 @@ access_rules:
 
 - **Implicit full-match anchoring.** Every `path_regex` is wrapped as `\A(?:<your_pattern>)\z` before compilation. Your pattern must match the entire path, not a prefix or substring. Adding your own `^` or `$` is harmless but redundant. The wrapping is non-capturing, which means alternations like `path_regex: 'foo|bar'` behave as `(?:foo|bar)` against the full path — neither branch matches `/prefix/foo` or `/foo/extra`.
 - **Same normalized path as glob.** The regex runs against the same normalized path glob sees: leading `/`, no trailing `/` (root stays `/`), interior `//` collapsed. A request to `/v1//records/REC-1` matches `path_regex: '/v1/records/REC-\d+'` for the same reason it would match the equivalent glob.
-- **First-match ordering is preserved.** Regex and glob rules can be mixed freely in the same `access_rules` list. Rules are still evaluated top-to-bottom, first match wins, with implicit deny at the end if rules are defined.
+- **First-match ordering is preserved.** Regex and glob rules can be mixed freely in the same `access_rules` list. Rules are still evaluated top-to-bottom, first match wins, with implicit deny at the end if rules are defined. First-match-wins and implicit deny are [proved for an arbitrary per-rule matcher](#machine-checked-proofs), so they cover regex and glob rules equally; RE2's own matching behaviour is not modelled.
 - **Method semantics are unchanged.** `method: ALL` matches any verb; specific methods only match that verb. Regex applies to the path only — there is no method regex.
 
 ### RE2 dialect (no lookahead, no backreferences)
@@ -189,6 +195,81 @@ go test -fuzz=FuzzAccessPolicyBypass -fuzztime=5m ./internal/proxy/
 ```
 
 The six access rule targets have been run for millions of executions each with zero bypasses or panics found. Run the redaction targets the same way (`go test -fuzz=FuzzRedactStreaming -fuzztime=60s ./internal/proxy/`) when changing the redactors; CI runs the seed corpus of every target as part of `go test`, not a fuzzing campaign.
+
+## Machine-Checked Proofs
+
+The access-rule matcher and the response redactors are modelled in
+[Dafny](https://dafny.org) under [`formal/`](../formal) and the models are
+verified in CI by [`.github/workflows/formal.yml`](../.github/workflows/formal.yml),
+which installs a pinned, SHA-256-checked Dafny 4.11.0 and runs
+`dafny verify --verification-time-limit 60` over every file. Warnings are
+errors, so a file that verifies with a warning still fails the job. The whole
+suite is 248 proof obligations and takes about 20 seconds.
+
+Nothing in `formal/` is axiomatised and nothing is assumed away inside a proof:
+CI rejects the build if `{:axiom}` or an `assume` statement appears anywhere
+under `formal/`. Everything listed under "What is assumed" below is a statement
+about the gap between the models and the shipped Go, not a hole inside a proof.
+
+| File | Models |
+|---|---|
+| `formal/path.dfy` | `splitPath`, `matchSegment`, the segment caps |
+| `formal/glob.dfy` | `matchPattern`, `collapseDoublestar`, `matchSegments` |
+| `formal/policy.dfy` | `(*AccessPolicy).Allowed` |
+| `formal/redact.dfy` | `bytes.ReplaceAll`, `redactAll`, `redactionSafe` |
+| `formal/stream.dfy` | `tokenReplacer`, `streamRedactor` |
+
+### What is proved
+
+Access rules, for an **arbitrary** per-rule matcher — the model leaves `hit`
+uninterpreted, so these hold for glob and `path_regex` rules alike:
+
+- **First match wins.** If rule *k* is the first applicable rule, the decision is exactly `rules[k].action == ALLOW`.
+- **Implicit deny.** If rules are defined and none applies, the request is denied.
+- **Explicit deny-all.** `access_rules: []` denies every request.
+- **The 256-segment cap denies before any rule is consulted.** Proved over `len(splitPath(path))` computed by the modelled splitter, not over a free parameter, and proved to hold even against a rule list that would otherwise allow everything. This is intended behaviour, not a limitation — see [Path Normalization](#path-normalization).
+- **No rules means no restrictions.** Faithful to the shipped code; see the note below.
+
+The glob matcher:
+
+- **`*` never matches an empty segment.** Both halves: `matchSegment("*", "")` is false, and `splitPath` never produces an empty segment, so the matcher is never offered one.
+- **The shipped bottom-up DP equals a declarative glob semantics** (`**` matches zero or more segments, `*` exactly one non-empty segment) whenever the 64/256 caps allow, and denies above them.
+- **Collapsing consecutive `**` does not change what matches.** `collapseDoublestar` is an optimisation against exponential branching; it is proved to accept exactly the same language.
+- **The whole `matchPattern` composition** — `splitPath`, then `collapseDoublestar`, then the DP — equals the declarative semantics of the *uncollapsed* pattern under the caps.
+
+Redaction, under the credential constraint stated below:
+
+- **A bracket-free secret cannot overlap the placeholder.** It contains no `[REDACTED]`, has no suffix that is a placeholder prefix, and no prefix that is a placeholder suffix — so a replacement cannot splice the secret back together across its own boundary.
+- **One pass removes every occurrence of its secret and creates none.**
+- **Replacing one secret cannot resurrect another.** Later passes only insert placeholders and delete their own token, neither of which can spell a bracket-free secret that was not already there.
+- **No secret appears in the output of `redactAll`,** for any number of secrets in any order.
+- **Streamed redaction equals one-shot redaction, for every chunking.** The chunk list is universally quantified, so this covers every way the upstream could split the body, including splitting a secret byte by byte across reads. Two different chunkings of the same body give byte-identical output.
+- **No secret appears in the streamed output, for every chunking** — the previous two results composed.
+
+### No rules means no restrictions
+
+`Allowed` returns true when a route has no `access_rules`, and the model states
+that explicitly rather than hiding it. It is not a fail-open path: **strict mode
+is the default and rejects a route with no `access_rules` at config load**, so
+an unconfigured route fails to start rather than serving traffic unrestricted.
+Reaching this branch requires an operator to have set `strict: false` *and*
+omitted `access_rules`.
+
+### What is assumed
+
+The proofs are about the models. These are the gaps between the models and the
+running binary:
+
+- **The models are hand-written transliterations of the Go, not generated from it.** No `dafny translate` output ships. The link is `internal/proxy/formal_diff_test.go`, which compares the shipped `splitPath`, `collapseDoublestar`, `matchSegment`, `matchPattern`, `AccessPolicy.Allowed`, `redactAll`, `tokenPrefixSuffixLen` and `streamRedactor` against hand-written Go reference implementations that mirror each Dafny definition line for line, over edge cases plus seeded pseudo-random input. It runs under `go test -race ./...`. A change to either side that breaks the correspondence fails that test, but the correspondence is checked by testing, not proved.
+- **`splitPath`'s use of the standard library is discharged by test, not proof.** The model splits on every `/` and drops empty pieces; the shipped code calls `strings.Trim` then `strings.Split` then filters. These are equal because `Trim` only removes leading and trailing `/`, each of which contributes an empty piece that the filter drops — an argument about the standard library, checked by `TestSplitPathMatchesDafnySplitPath`.
+- **The credential constraint includes one condition `redactionSafe` does not enforce.** The redaction theorems assume a secret is nonempty, free of `[` and `]`, **and not itself a substring of the literal text `[REDACTED]`**. `redactionSafe` enforces the brackets; it does not reject a credential like `RED` or `ACTED`. Such a credential does "appear" in redacted output, but only as part of the constant placeholder text, which carries no information about it. This is the same argument made in [Credential Characters and Redaction](#credential-characters-and-redaction), and it is an argument, not a theorem.
+- **`path_regex` semantics are not modelled.** The per-rule matcher is uninterpreted, which is why first-match-wins, implicit deny and the segment cap cover regex rules too. But RE2's own behaviour, the `\A(?:...)\z` anchoring wrapper, and `normalizePath` are outside the models. The anchoring argument is in [Regex Path Matching](#regex-path-matching-path_regex) and is covered by tests and fuzzing, not proofs.
+- **The reader plumbing is not modelled.** The proofs cover the redaction algebra: the cascade receives some partition of its input followed by exactly one flush. That both shipped readers do deliver such a partition — `redactingReader` pushing `buf[:n]` per `Read` and flushing once when the upstream ends, `sseEventReader` calling the transform per event batch and the final hook once in `drain()` — is read off the code, not proved. Buffering, error ordering and `Close` behaviour are covered by tests only.
+- **SSE line-ending normalization happens before redaction.** `\r\n` and lone `\r` become `\n` on the way into the cascade, so the streaming guarantee is about the normalized byte stream, which is what the agent receives.
+- **`prepareRedactTokens`' ordering and deduplication are not modelled.** Neither theorem needs them: both hold for any token order, and the streaming and one-shot sides are always handed the same list. Longest-first ordering is a quality-of-redaction choice, not a safety property here.
+- **Alphabet.** Dafny `string` is a sequence of characters; the redactors operate on `[]byte`. The redaction proofs never inspect an element except to compare it with `[` or `]`, so they hold over sequences of any element type with those two values distinguished, and both brackets are single-byte ASCII. The same applies to `/` in the path model.
+- **Performance is not proved.** The DP is proved correct and terminating, not O(P×S).
+- **The toolchain is trusted.** Dafny 4.11.0 and its bundled Z3 are assumed sound; the release archive is pinned by SHA-256 but the proof checker itself is trusted.
 
 ## HTTP Status Codes
 
