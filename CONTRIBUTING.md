@@ -28,6 +28,28 @@ go test -fuzz=FuzzMatchPatternNoPanic -fuzztime=5m ./internal/proxy/
 
 See [docs/security.md](docs/security.md) for all six fuzz targets.
 
+## Formal Proofs
+
+The access-rule matcher and the response redactors are modelled in Dafny under
+`formal/`. CI verifies them on every pull request with a pinned, checksummed
+Dafny 4.11.0. To run them locally, install [Dafny 4.11.0](https://github.com/dafny-lang/dafny/releases/tag/v4.11.0)
+and run the same command CI runs:
+
+```bash
+for f in formal/*.dfy; do dafny verify --verification-time-limit 60 "$f"; done
+```
+
+Every file must verify with 0 errors and no warnings. Nothing in `formal/` may
+be axiomatised — CI fails the build if `{:axiom}` or an `assume` statement
+appears there.
+
+If you change `splitPath`, `collapseDoublestar`, `matchSegment`, `matchPattern`,
+`AccessPolicy.Allowed`, `redactAll`, `tokenPrefixSuffixLen` or the streaming
+redactors, update the corresponding model and the reference implementations in
+`internal/proxy/formal_diff_test.go`, which are what tie the models to the
+shipped code. See [docs/security.md](docs/security.md#machine-checked-proofs)
+for what is proved and what is assumed.
+
 ## Pull Requests
 
 1. Fork the repo and create a branch from `main`.

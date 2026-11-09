@@ -1,0 +1,91 @@
+name: Formal
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # Pinned Dafny release. The archive is checked against its SHA-256
+  # before anything inside it is executed. Bump all three together.
+  DAFNY_VERSION: 4.11.0
+  DAFNY_ZIP: dafny-4.11.0-x64-ubuntu-22.04.zip
+  DAFNY_SHA256: a46a9ff7cdd720f7955854c78e95df13f4cfe6b80691b05f8654fe19e8267179
+  # Per-verification-task limit. Any obligation that does not close in
+  # this many seconds is reported as a timeout and fails the job.
+  DAFNY_TIME_LIMIT: 60
+
+jobs:
+  verify:
+    name: Verify proofs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and verify pinned Dafny ${{ env.DAFNY_VERSION }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dafny-dl"
+          cd "$RUNNER_TEMP/dafny-dl"
+          curl --fail --silent --show-error --location \
+            --retry 3 --retry-all-errors \
+            -o "$DAFNY_ZIP" \
+            "https://github.com/dafny-lang/dafny/releases/download/v${DAFNY_VERSION}/${DAFNY_ZIP}"
+          echo "${DAFNY_SHA256}  ${DAFNY_ZIP}" > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+          unzip -q "$DAFNY_ZIP" -d extracted
+          echo "DAFNY=$RUNNER_TEMP/dafny-dl/extracted/dafny/dafny" >> "$GITHUB_ENV"
+
+      - name: Report Dafny version
+        run: |
+          set -euo pipefail
+          "$DAFNY" --version
+
+      # The proofs are only worth as much as the absence of escape
+      # hatches. An {:axiom} attribute or an assume statement would let
+      # Dafny accept an unproved obligation silently.
+      - name: Reject axioms and assumed obligations
+        run: |
+          set -euo pipefail
+          if grep -rnE '\{:axiom\}|\bassume\b' formal/; then
+            echo "::error::formal/ must not contain {:axiom} or assume"
+            exit 1
+          fi
+          echo "No axioms and no assumed obligations in formal/."
+
+      - name: Verify every file in formal/
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          files=(formal/*.dfy)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no .dfy files found in formal/"
+            exit 1
+          fi
+
+          failed=0
+          for f in "${files[@]}"; do
+            echo "::group::dafny verify $f"
+            start=$(date +%s)
+            # Warnings are errors by default, so a file that verifies
+            # with a warning still fails here.
+            if "$DAFNY" verify --verification-time-limit "$DAFNY_TIME_LIMIT" "$f"; then
+              status=ok
+            else
+              status=FAILED
+              failed=1
+              echo "::error file=$f::dafny verify reported an error or timeout"
+            fi
+            echo "$f: $status ($(( $(date +%s) - start ))s)"
+            echo "::endgroup::"
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::formal verification failed"
+            exit 1
+          fi
+          echo "All ${#files[@]} file(s) in formal/ verified with 0 errors."
