@@ -176,10 +176,7 @@ func initRouteProxy(route *Route, logger *slog.Logger) {
 			req.URL.Host = upstream.Host
 			req.Host = upstream.Host
 			if stripPrefix != "" {
-				req.URL.Path = strings.TrimPrefix(req.URL.Path, stripPrefix)
-				if req.URL.Path == "" {
-					req.URL.Path = "/"
-				}
+				req.URL.Path = stripRoutePrefix(req.URL.Path, stripPrefix)
 			}
 		},
 		Transport: baseTransport,
@@ -393,7 +390,7 @@ func (rt *Router) matchRoute(path string) *Route {
 	rt.mu.RUnlock()
 
 	for _, route := range routes {
-		if strings.HasPrefix(path, route.PathPrefix) {
+		if PathPrefixMatches(route.PathPrefix, path) {
 			return route
 		}
 	}
@@ -417,10 +414,9 @@ func (rt *Router) handleRoute(route *Route, w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	targetPath := strings.TrimPrefix(r.URL.Path, route.StripPrefix)
-	if targetPath == "" {
-		targetPath = "/"
-	}
+	// The same helper the Director uses, so the path checked against the
+	// access policy is the path the upstream receives.
+	targetPath := stripRoutePrefix(r.URL.Path, route.StripPrefix)
 	// strip_prefix can expose a dot segment, e.g. "/api../x" with
 	// strip_prefix "/api" leaves "../x".
 	if hasAmbiguousPath(targetPath) {

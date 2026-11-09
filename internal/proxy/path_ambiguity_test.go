@@ -58,10 +58,6 @@ func TestRouter_RejectsDotSegmentsAndBackslashes(t *testing.T) {
 		"/api/allowed/%2e/admin",
 		"/api/..",
 		"/api/%2e%2e",
-		// Only a dot segment once strip_prefix is applied.
-		"/api../admin",
-		"/api%2e%2e/admin",
-		"/api./x",
 		// Literal backslash.
 		`/api/allowed\..\admin`,
 		`/api/a\b`,
@@ -73,6 +69,18 @@ func TestRouter_RejectsDotSegmentsAndBackslashes(t *testing.T) {
 			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		})
 	}
+	// Paths that only look like they are under the prefix. Route prefixes
+	// match on segment boundaries, so these belong to no route at all and
+	// never reach an upstream or a strip_prefix.
+	for _, p := range []string{"/api../admin", "/api%2e%2e/admin", "/api./x"} {
+		t.Run(p, func(t *testing.T) {
+			resp, err := http.Get(gw.URL + p)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+			assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+		})
+	}
+
 	assert.Zero(t, hits.Load(), "no ambiguous path may reach the upstream")
 
 	for _, p := range []string{"/api/a.b/c", "/api/...", "/api/.well-known/x", "/api/v1..2"} {
