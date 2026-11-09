@@ -492,11 +492,15 @@ lemma ContainsAnyMetaIsNotBracketFree(t: string)
 
 // The empty string is a substring of the placeholder, so the substring
 // condition rejects it. This is the conjunct that used to be carried by
-// RedactableTok's |t| > 0 with no corresponding check in the Go.
+// RedactableTok's |t| > 0 with no corresponding check in the Go: the
+// rejection is stated here as well as the substring fact, so nothing is
+// left to a comment.
 lemma EmptyIsSubstringOfPlaceholder()
   ensures SubstringOfPlaceholder("")
+  ensures !RedactionSafe([""])
 {
   assert OccursAt(PH, "", 0) by { assert PH[0..0] == ""; }
+  assert [""][0] == "";
 }
 
 // R4, the implication the spec asks for:
@@ -523,8 +527,14 @@ lemma RedactionSafeImpliesRedactable(secrets: seq<string>)
 }
 
 // The converse direction, for completeness: the check is not stronger
-// than the constraint either, so redactionSafe refuses exactly the
-// credentials the proofs cannot cover -- no safe credential is rejected.
+// than the constraint either, so RedactionSafe and RedactableTokens are
+// equivalent and the check rejects no credential that satisfies the
+// theorems' precondition.
+//
+// This is a statement about RedactableTok, not about re-spellability in
+// general. The bracket rule is deliberately conservative: it refuses
+// some credentials, such as "X]]", that no body could actually re-form.
+// Narrowing it is not worth the proof it would cost.
 lemma RedactableImpliesRedactionSafe(secrets: seq<string>)
   requires RedactableTokens(secrets)
   ensures RedactionSafe(secrets)
