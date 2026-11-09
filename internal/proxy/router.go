@@ -320,6 +320,22 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject method override headers rather than stripping them. The access
+	// policy authorizes the request method; a framework or upstream that
+	// honours one of these headers would then perform a different method
+	// than the one that was checked. Like an ambiguous path, an ambiguous
+	// method is refused, not cleaned up.
+	if name := methodOverrideHeader(r.Header); name != "" {
+		rt.logger.Warn("rejected request with method override header",
+			"header", name,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"remote", r.RemoteAddr,
+		)
+		http.Error(w, "Bad Request: method override headers not allowed", http.StatusBadRequest)
+		return
+	}
+
 	// Reject encoded path separators (%2f, %5c) to prevent interpretation
 	// mismatches between the policy (which sees decoded r.URL.Path) and
 	// upstreams (which may interpret the raw encoding differently).
@@ -353,6 +369,30 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rt.handleRoute(route, w, r)
+}
+
+// methodOverrideHeaders are headers that some frameworks and upstreams honour
+// in place of the request method. Airlock authorizes the method it routes on,
+// so a request carrying one of these is rejected instead of forwarded.
+var methodOverrideHeaders = []string{
+	"X-HTTP-Method-Override",
+	"X-HTTP-Method",
+	"X-Method-Override",
+}
+
+// methodOverrideHeader returns the name of the first method override header
+// present, matched without regard to case, or "" if there is none. Go
+// canonicalises header names on parsed requests; the explicit comparison also
+// covers headers set directly on the map.
+func methodOverrideHeader(h http.Header) string {
+	for name := range h {
+		for _, override := range methodOverrideHeaders {
+			if strings.EqualFold(name, override) {
+				return override
+			}
+		}
+	}
+	return ""
 }
 
 // containsEncodedPathSep checks for %2f or %5c (case-insensitive) in encoded paths.
