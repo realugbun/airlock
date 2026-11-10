@@ -44,8 +44,9 @@ be axiomatised — CI fails the build if `{:axiom}` or an `assume` statement
 appears there.
 
 If you change `splitPath`, `collapseDoublestar`, `matchSegment`, `matchPattern`,
-`AccessPolicy.Allowed`, `redactAll`, `tokenPrefixSuffixLen` or the streaming
-redactors, update the corresponding model and the reference implementations in
+`AccessPolicy.Allowed`, `redactAll`, `redactionSafe`, `tokenPrefixSuffixLen` or
+the streaming redactors, update the corresponding model and the reference
+implementations in
 `internal/proxy/formal_diff_test.go`, which are what tie the models to the
 shipped code. See [docs/security.md](docs/security.md#machine-checked-proofs)
 for what is proved and what is assumed.
