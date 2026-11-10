@@ -90,6 +90,8 @@ On a route whose `mcp_rules` lists `allowed_tools` or `denied_tools`, a POST bod
 
 `mcp_rules: {}` enforces nothing and keeps forwarding such requests unchanged.
 
+That an uninspectable body is never forwarded, that a batch is all-or-nothing, and that the tools an agent can see are exactly the tools it can call are [proved](#mcp).
+
 ## Time and Size Limits
 
 - A route's `timeout` starts when the request is routed and covers reading and inspecting the body and resolving secrets. A body not received in time gets `408 Request Timeout`
@@ -216,13 +218,14 @@ The six access rule targets have been run for millions of executions each with z
 
 ## Machine-Checked Proofs
 
-The access-rule matcher and the response redactors are modelled in
+The access-rule matcher, the response redactors and MCP tool
+authorization are modelled in
 [Dafny](https://dafny.org) under [`formal/`](../formal) and the models are
 verified in CI by [`.github/workflows/formal.yml`](../.github/workflows/formal.yml),
 which installs a pinned, SHA-256-checked Dafny 4.11.0 and runs
 `dafny verify --verification-time-limit 60` over every file. Warnings are
 errors, so a file that verifies with a warning still fails the job. The whole
-suite is 248 proof obligations and takes about 20 seconds.
+suite is 304 proof obligations and takes about 25 seconds.
 
 Nothing in `formal/` is axiomatised and nothing is assumed away inside a proof:
 CI rejects the build if `{:axiom}` or an `assume` statement appears anywhere
@@ -236,6 +239,7 @@ about the gap between the models and the shipped Go, not a hole inside a proof.
 | `formal/policy.dfy` | `(*AccessPolicy).Allowed` |
 | `formal/redact.dfy` | `bytes.ReplaceAll`, `redactAll`, `redactionSafe` |
 | `formal/stream.dfy` | `tokenReplacer`, `streamRedactor` |
+| `formal/mcp.dfy` | `isToolDenied`, `checkSingle`, `checkBatch`, `enforceRequest`, the `tools/list` name filter |
 
 ### What is proved
 
@@ -264,6 +268,38 @@ Redaction, under the credential constraint stated below:
 - **Streamed redaction equals one-shot redaction, for every chunking.** The chunk list is universally quantified, so this covers every way the upstream could split the body, including splitting a secret byte by byte across reads. Two different chunkings of the same body give byte-identical output.
 - **No secret appears in the streamed output, for every chunking** — the previous two results composed.
 
+### MCP
+
+MCP tool authorization is modelled in [`formal/mcp.dfy`](../formal/mcp.dfy)
+over an **abstract parsed message** — a method, a tool name and an id, or a
+`Malformed` constructor for a body that is not well-formed or whose
+policy-relevant keys are ambiguous. `path.Match` is left uninterpreted, and the
+**same** uninterpreted matcher is used by the `tools/call` check and by the
+`tools/list` filter, so every property below holds for any glob behaviour
+whatsoever.
+
+The two tool lists are mutually exclusive, which is checked both at config load
+and in the policy constructor. The model states that as a precondition and
+proves the constructor is what enforces it:
+
+- **A config that sets both `allowed_tools` and `denied_tools` is refused,** so no policy value the other theorems range over can carry both lists.
+- **A non-empty list always selects its own mode.** Every entry lands in either the exact set or the pattern list, so a non-empty `allowed_tools` always produces allowlist mode and never silently degrades to pass-through. `checkEmptyAllowlists` separately rejects a present-but-empty `allowed_tools`, which is the one way an operator could reach pass-through while believing they had written an allowlist.
+- **Allowlist mode allows only listed tools**, and **denylist mode denies exactly the listed tools**, in both cases exact names plus pattern matches and nothing else.
+- **No lists means pass-through** — nothing is denied. Stated explicitly rather than hidden, as with access rules.
+
+The request path:
+
+- **A forwarded `tools/call` names a tool the policy allows.** Stated for a single message and for every element of a batch, via the names a body would have the upstream execute.
+- **A batch is all-or-nothing.** It is forwarded **if and only if** every element is well-formed and no element is a denied `tools/call`. Every element is parsed before any element is authorized, so one malformed element in any position rejects the whole batch instead of travelling alongside the others.
+- **With tool rules set, a body that cannot be inspected is never forwarded.** Proved in both directions: uninspectable implies rejected, and forwarded implies inspectable. A compressed body, a non-JSON or duplicated `Content-Type`, an oversized body, a body that is not valid UTF-8, and a body that is not a JSON array when it opens with `[` are all uninspectable, because Airlock cannot read them the way the upstream will. (An array whose *elements* are not JSON-RPC objects, such as `[1,2]`, is stopped one step later, by the all-or-nothing batch property above: each element parses as malformed.)
+- **A forwarded POST carries no `tools/call` the policy does not allow**, in every mode. In pass-through mode this holds because the policy allows everything, which is the configured behaviour.
+
+The response path:
+
+- **`tools/list` filtering keeps exactly the allowed tools, in order.** Proved as a strictly ascending index map into the upstream list that selects precisely the allowed positions: every allowed tool is kept, no denied tool survives, no tool is invented, and the upstream's order is preserved.
+- **Listing and calling agree.** A tool survives the `tools/list` filter **if and only if** a `tools/call` naming it is forwarded, and a tool hidden from the listing is refused by name when called. Both sides are the same predicate over the same uninterpreted matcher, so they cannot drift apart.
+- **The `tools/list` request itself is always forwarded.** It is not a `tools/call`; it is the response that is filtered.
+
 ### No rules means no restrictions
 
 `Allowed` returns true when a route has no `access_rules`, and the model states
@@ -287,6 +323,13 @@ running binary:
 - **`prepareRedactTokens`' ordering and deduplication are not modelled.** Neither theorem needs them: both hold for any token order, and the streaming and one-shot sides are always handed the same list. Longest-first ordering is a quality-of-redaction choice, not a safety property here.
 - **Alphabet.** Dafny `string` is a sequence of characters; the redactors operate on `[]byte`. The redaction proofs never inspect an element except to compare it with `[` or `]`, so they hold over sequences of any element type with those two values distinguished, and both brackets are single-byte ASCII. The same applies to `/` in the path model.
 - **Performance is not proved.** The DP is proved correct and terminating, not O(P×S).
+- **JSON decoding is not modelled.** The MCP model starts from an already-parsed message, so no proof covers `parseRPCMessage` or `decodeStrictObject`. They are covered instead by the adversarial differential tests in `internal/proxy/formal_mcp_diff_test.go`, which re-derive the policy-relevant fields with an independent JSON scanner — its own tokenizer, its own escape decoding including `\uXXXX` and surrogate pairs, its own Unicode case folding, no `encoding/json` and no `strings.EqualFold` — and check that duplicate keys, case-variant keys, non-object `params`, batches mixing valid and invalid elements, trailing data, BOMs and truncations are **rejected** rather than decided one way. That is testing, not proof.
+- **An escape-spelled key is read, not refused.** `{"params":{"\u006eame":"x"}}` is accepted and the tool name is read as `x`, because every JSON parser decodes `\u006eame` to `name` — there is only one reading, so there is nothing to be ambiguous about. What is refused is an escape spelling that **collides** with another spelling of the same key (`{"name":"a","\u006eame":"b"}`) or that decodes to a case variant (`{"\u004Eame":"a"}`, `{"param\u017f":{…}}`, where U+017F folds to `s`). `TestEscapeSpelledKeysAreReadNotRejected` pins the accepting half, and the ambiguous corpus pins the refusing half.
+- **`{"method":null}` is read as a message with no method.** `encoding/json` treats JSON `null` as a silent no-op for a string target, so a null `method` is forwarded as a non-tool message rather than refused. No reading of it executes a tool — an empty method is not `tools/call` and no upstream can dispatch it — so it is not a policy-relevant ambiguity, but it is leniency rather than strictness, and it is pinned by `TestNullMethodIsReadAsNoMethod`. A null `params.name` is refused, because the parser requires a non-empty name.
+- **The `tools/list` filter reads tool names leniently; the request check does not.** The response filter decodes each entry with `encoding/json`, which is case-insensitive and keeps the last duplicate, so a hostile upstream advertising `{"name":"admin_delete","Name":"calendar_read"}` can make a **listing** misleading. It cannot make a **call** succeed: the request path reads the name strictly and independently, so the ambiguous call is refused outright and the unambiguous hostile name is denied. `TestListingNameAmbiguityCannotAuthorizeACall` pins that. An entry that does not decode into `{name string}` at all is passed through untouched and contributes no name; the model carries that branch explicitly.
+- **A non-POST request is forwarded uninspected.** The request theorems are stated for POST. MCP carries JSON-RPC payloads over POST; `GET` opens the server-sent-event channel and `DELETE` ends a session, neither of which can invoke a tool. That is a statement about the MCP transport, not a theorem.
+- **Response framing is not modelled.** The `tools/list` proofs are about the name filter. SSE envelope handling (`filterSSEToolsList`, `newMCPToolFilterReader`, `filterMCPEventData`) and the re-serialization of the JSON envelope are covered by tests only.
+- **`isGlobPattern`'s split between the exact map and the pattern list is left uninterpreted,** like `path.Match` itself. No property depends on which bucket an entry lands in, only that it lands in exactly one.
 - **The toolchain is trusted.** Dafny 4.11.0 and its bundled Z3 are assumed sound; the release archive is pinned by SHA-256 but the proof checker itself is trusted.
 
 ## HTTP Status Codes
