@@ -66,14 +66,13 @@ func FuzzRedactStreaming(f *testing.F) {
 				secrets, body, cuts, wantSSE, gotSSE)
 		}
 
-		// 2. No secret survives redaction.
+		// 2. No secret survives redaction. redactionSafe now enforces the
+		// whole credential constraint, so every secret it accepts is
+		// checked -- there is no substring-of-placeholder exemption left.
 		if !redactionSafe(secrets) {
 			return
 		}
 		for _, s := range secrets {
-			if s == "" || bytes.Contains(redactedPlaceholder, []byte(s)) {
-				continue
-			}
 			for _, out := range [][]byte{got, gotSSE} {
 				if bytes.Contains(out, []byte(s)) {
 					t.Fatalf("secret %q survived redaction\nbody %q\ncuts %v\noutput %q",
@@ -124,9 +123,6 @@ func FuzzRedactHeaderValues(f *testing.F) {
 				out, oneShotRedact(secrets, []byte(value)))
 		}
 		for _, s := range secrets {
-			if s == "" || strings.Contains(string(redactedPlaceholder), s) {
-				continue
-			}
 			if strings.Contains(out, s) {
 				t.Fatalf("secret %q survived header redaction: %q", s, out)
 			}

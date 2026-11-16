@@ -7,7 +7,10 @@ import (
 	"strings"
 )
 
-var redactedPlaceholder = []byte("[REDACTED]")
+// placeholderText is the literal that replaces a credential.
+const placeholderText = "[REDACTED]"
+
+var redactedPlaceholder = []byte(placeholderText)
 
 // placeholderMeta are the bytes of redactedPlaceholder that make a credential
 // containing them unsafe to redact: a replacement can sit next to body bytes
@@ -55,19 +58,38 @@ func redactAll(tokens [][]byte, body []byte) []byte {
 }
 
 // redactionSafe reports whether secrets can be redacted without the output
-// being able to spell a secret again.
+// being able to spell a secret again. It refuses a secret on either of two
+// grounds, and together they are exactly the precondition the redaction proofs
+// in formal/redact.dfy need (RedactableTok): nonempty, bracket-free, and not a
+// substring of the placeholder text.
 //
-// The placeholder opens with '[' and closes with ']', so any span of output
-// that overlaps a replacement without being contained in it includes one of
-// those two bytes. A secret containing neither can therefore only reappear
-// inside a placeholder — that is, as a substring of the constant placeholder
-// text, which carries no information about the secret. A secret containing
-// '[' or ']' has no such guarantee: for a credential of "]Z!" the body "]Z!Z!"
-// redacts to "[REDACTED]Z!", in which the placeholder's closing ']' and the
-// trailing "Z!" spell the credential again.
+// First, a secret containing '[' or ']'. The placeholder opens with '[' and
+// closes with ']', so any span of output that overlaps a replacement without
+// being contained in it includes one of those two bytes; a secret containing
+// neither can therefore only reappear inside a placeholder. A secret
+// containing one has no such guarantee: for a credential of "]Z!" the body
+// "]Z!Z!" redacts to "[REDACTED]Z!", in which the placeholder's closing ']'
+// and the trailing "Z!" spell the credential again.
+//
+// Second, a secret that is a substring of the placeholder text itself, such as
+// "REDACT" or "ED" (or the empty string). Such a secret does appear in every
+// redacted response that contains any replacement at all. The appearance
+// carries no information — the bytes come from a constant, not from the
+// credential — but "no secret appears in the output" is then false as stated,
+// so the check refuses the credential rather than leaving the guarantee with a
+// caveat the proofs have to assume away. Bracket-free substrings of
+// "[REDACTED]" are substrings of "REDACTED", so this rejects short alphabetic
+// credentials only.
+//
+// Both are refused on the same fail-closed path in the router: the request is
+// answered 500 and the upstream is never contacted. The secret value is never
+// logged.
 func redactionSafe(secrets []string) bool {
 	for _, s := range secrets {
 		if strings.ContainsAny(s, placeholderMeta) {
+			return false
+		}
+		if strings.Contains(placeholderText, s) {
 			return false
 		}
 	}

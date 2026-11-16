@@ -2,6 +2,8 @@
 
 Airlock is designed as a **per-agent sidecar**. Run one instance per agent — this is the default security boundary. If multiple agents share one Airlock instance, they all get the same credentials and access rules.
 
+"Sidecar" here means one gateway per agent, not necessarily one container per pod. On Kubernetes, prefer a separate gateway pod: a sidecar *container* in the agent's own pod shares the agent's network namespace, so a NetworkPolicy cannot isolate the agent's egress from the gateway's. See [Same-pod (sidecar container) deployment](#same-pod-sidecar-container-deployment).
+
 ## Docker
 
 ```bash
@@ -84,7 +86,10 @@ See `deploy/helm/airlock/values.yaml` for all options.
 
 ### Agent NetworkPolicy
 
-Apply a NetworkPolicy to your agent pods so they can only reach the Airlock gateway:
+Apply a NetworkPolicy to your agent pods so they can only reach the Airlock gateway.
+This requires the agent and the gateway to be in **separate pods** — see
+[Same-pod (sidecar container) deployment](#same-pod-sidecar-container-deployment)
+below for why a NetworkPolicy cannot isolate them otherwise:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -114,6 +119,34 @@ spec:
         - port: 8080
           protocol: TCP
 ```
+
+### Same-pod (sidecar container) deployment
+
+Airlock can run as a second container inside the agent's own pod, bound to
+`127.0.0.1:8080` so only that agent can reach it. **A NetworkPolicy cannot
+isolate the agent's egress in this arrangement.** Containers in a pod share one
+network namespace — the same IP, loopback interface and routing table — and a
+NetworkPolicy selects pods, not containers. Its `egress` rules therefore apply
+to the whole pod: every upstream the policy must allow for Airlock to reach is
+equally reachable from the agent container, directly, bypassing access rules,
+MCP filtering and rate limits. Binding the gateway to loopback does not change
+this; it restricts who can reach Airlock, not where the agent can go.
+
+For egress isolation, use one of:
+
+- **Separate pods** — the agent in its own pod with the
+  [Agent NetworkPolicy](#agent-networkpolicy) above, and the gateway in the
+  Deployment the Helm chart creates. Different pods have different IPs, so the
+  policy can distinguish them. This is the documented pattern.
+- **An egress control that works below pod granularity** — an authenticating
+  egress proxy whose credential the agent does not have, a service mesh with
+  per-workload identity, or host/cloud firewall rules keyed on something other
+  than the pod IP.
+
+Same-pod mode is a reasonable choice when Airlock is there for credential
+injection, auditing and rate limiting and the agent container is trusted not to
+make its own outbound calls. It is not a containment boundary. See
+[Security](security.md#same-pod-deployment-and-egress-isolation).
 
 ### DNS Hardening
 

@@ -18,15 +18,17 @@ import (
 
 // A credential containing '[' or ']' can combine with the bytes next to a
 // "[REDACTED]" replacement and spell the credential again, so it cannot be
-// redacted from a response.
+// redacted from a response. A credential that is a substring of the
+// placeholder text appears in the placeholder itself, so it cannot either.
 func TestRedactionSafe_BracketsRefused(t *testing.T) {
 	safe := [][]string{
 		{"sk-abc"},
 		{"sk-abc", "Bearer sk-abc"},
-		{""},
 		nil,
-		{"REDACTED"},
 		{"token-with-{braces}"},
+		// Not substrings of "[REDACTED]".
+		{"REDACTEDX"},
+		{"redacted"},
 	}
 	for _, secrets := range safe {
 		assert.True(t, redactionSafe(secrets), "%q should be redactable", secrets)
@@ -38,6 +40,13 @@ func TestRedactionSafe_BracketsRefused(t *testing.T) {
 		{"sk-abc]"},
 		{"sk-abc", "Bearer sk-[abc"},
 		{"["},
+		// Substrings of the placeholder text, including the empty string.
+		{""},
+		{"REDACTED"},
+		{"RED"},
+		{"ACTED"},
+		{"ED"},
+		{"sk-abc", "DACT"},
 	}
 	for _, secrets := range unsafe {
 		assert.False(t, redactionSafe(secrets), "%q must not be redactable", secrets)

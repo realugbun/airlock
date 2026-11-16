@@ -30,6 +30,12 @@ include "redact.dfy"
 //   S2  NO SECRET IN THE STREAMED OUTPUT, for any chunking, obtained by
 //       composing S1 with redact.dfy's R3 (NoSecretInStreamedOutput).
 //
+//   S3  S2 UNDER THE SHIPPED CHECK ONLY: the same statement with
+//       redact.dfy's model of redactionSafe as its single hypothesis
+//       (NoStreamedSecretSurvivesTheShippedCheck), via R4. The streaming
+//       guarantee therefore holds for every redaction set the router
+//       forwards, with no assumed credential constraint.
+//
 // Both shipped readers are instances of S1. redactingReader pushes
 // r.buf[:n] per Read and calls flush exactly once when the upstream
 // returns an error or EOF; newSSERedactingReader passes sr.push as the
@@ -829,4 +835,25 @@ lemma ChunkingIrrelevant(toks: seq<string>, c1: seq<string>, c2: seq<string>)
 {
   StreamEqualsOneShot(toks, c1);
   StreamEqualsOneShot(toks, c2);
+}
+
+// =====================================================================
+// S3: NO SECRET IN THE STREAMED OUTPUT, UNDER THE SHIPPED CHECK.
+//
+// S2 with its hypothesis replaced by redact.dfy's model of
+// redactionSafe, which R4 proves implies RedactableTokens. The only
+// assumption left is that the cascade receives some partition of the
+// body followed by one flush, which is a fact about the reader plumbing
+// and not about the credential.
+// =====================================================================
+lemma NoStreamedSecretSurvivesTheShippedCheck(toks: seq<string>, chunks: seq<string>)
+  requires RedactionSafe(toks)
+  ensures RedactableTokens(toks)
+  ensures forall i :: 0 <= i < |toks| ==> |toks[i]| > 0
+  ensures OkToks(InitCascade(toks))
+  ensures forall i :: (0 <= i < |toks|
+          ==> !Occurs(StreamOut(InitCascade(toks), chunks), toks[i]))
+{
+  RedactionSafeImpliesRedactable(toks);
+  NoSecretInStreamedOutput(toks, chunks);
 }

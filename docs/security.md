@@ -13,7 +13,7 @@ This document covers Airlock's security model, threat model, path normalization,
 
 ### Assumptions
 
-- **Network isolation is enforced.** Airlock assumes the agent cannot bypass it to reach external APIs directly. This requires Docker `internal: true` networks, Kubernetes NetworkPolicy, or equivalent network controls. Without isolation, the agent can simply call APIs directly.
+- **Network isolation is enforced.** Airlock assumes the agent cannot bypass it to reach external APIs directly. This requires Docker `internal: true` networks, Kubernetes NetworkPolicy, or equivalent network controls. Without isolation, the agent can simply call APIs directly. **A NetworkPolicy cannot provide this isolation when the agent and Airlock are containers in the same pod** — see [Same-Pod Deployment and Egress Isolation](#same-pod-deployment-and-egress-isolation).
 - **Upstream credentials are appropriately scoped.** Airlock controls which endpoints the agent can reach, but it cannot limit what the upstream API does with a valid request. Use the narrowest API scopes and permissions possible.
 - **One Airlock per agent.** The sidecar model is the default security boundary. If multiple agents share one Airlock instance, Airlock cannot distinguish between them for authorization purposes unless they are separated at deployment time.
 - **The host and container runtime are trusted.** Airlock does not defend against a compromised container runtime, kernel exploits, or host-level access.
@@ -31,8 +31,8 @@ This document covers Airlock's security model, threat model, path normalization,
 ## Production Checklist
 
 - [ ] Every route has `access_rules` — strict mode (default) enforces this at startup
-- [ ] Bind to loopback in same-pod mode: `listen: "127.0.0.1:8080"`
-- [ ] Network isolation: Docker `internal: true` network or K8s NetworkPolicy
+- [ ] Bind to loopback in same-pod mode: `listen: "127.0.0.1:8080"` — and note that a NetworkPolicy cannot isolate the agent's egress in that mode, see [Same-Pod Deployment and Egress Isolation](#same-pod-deployment-and-egress-isolation)
+- [ ] Network isolation: Docker `internal: true` network, or a K8s NetworkPolicy on a **separate** agent pod
 - [ ] Enable telemetry: set `telemetry.endpoint` for OTel traces and metrics
 - [ ] Set timeouts: `timeout` and `idle_timeout` on every route
 - [ ] Set rate limits: `rate_limit` on routes exposed to agents
@@ -43,6 +43,49 @@ This document covers Airlock's security model, threat model, path normalization,
 ## Injected Headers
 
 Before injecting credentials and `extra_headers`, Airlock removes the agent's `Connection` header, every header it names, and the standard hop-by-hop headers. Otherwise `Connection: Authorization` would make the proxy drop the injected credential. `auth.header` and `extra_headers` may not be hop-by-hop names.
+
+## Same-Pod Deployment and Egress Isolation
+
+Running Airlock as a second container in the agent's pod and binding it to
+`127.0.0.1:8080` is a convenient way to make the gateway reachable only by that
+agent. It controls *ingress* to Airlock. **It does not control the agent's
+egress, and a Kubernetes NetworkPolicy cannot make it do so.**
+
+Every container in a pod shares one network namespace. They share the pod's IP,
+its loopback interface and its routing table, and a NetworkPolicy selects
+*pods*, not containers. So a NetworkPolicy's `egress` rules apply to the pod as
+a whole: whatever the policy must permit for Airlock to reach its upstreams, the
+agent container can use directly. The two containers are indistinguishable to
+the policy engine, and to anything else that makes decisions from the source IP.
+
+Concretely, in same-pod mode:
+
+- An egress rule allowing `443/TCP` to the internet so Airlock can call the
+  upstream API lets the agent call that API itself, with its own credential if
+  it has one, bypassing access rules, MCP filtering and rate limits.
+- Binding Airlock to loopback does not help. It stops *other* pods reaching the
+  gateway; the agent was never going through the network to reach it.
+- Dropping the agent's `NET_RAW`, running it as non-root, or setting
+  `dnsPolicy: None` do not change this. They raise the cost of discovering a
+  destination, not the ability to reach a permitted one.
+
+Use one of these instead:
+
+- **A separate gateway pod with a NetworkPolicy on the agent pod.** This is the
+  arrangement [deploy/helm](deployment.md#kubernetes-helm) ships and the
+  [Agent NetworkPolicy](deployment.md#agent-networkpolicy) example configures:
+  the agent pod's only permitted egress is DNS plus the gateway Service, and the
+  gateway pod is the only thing with egress to the internet. Because they are
+  different pods they have different IPs, so the policy can tell them apart.
+- **An egress control that distinguishes containers rather than pods** — an
+  authenticating egress proxy the agent has no credential for, a service mesh
+  sidecar with per-workload identity, or host or cloud firewall rules keyed on
+  something finer-grained than the pod IP.
+
+Same-pod mode is still reasonable when the agent container is trusted not to
+make its own outbound calls and Airlock is there for credential injection,
+auditing and rate limiting rather than as a containment boundary. It is not a
+substitute for network isolation.
 
 ## Credential Characters and Redaction
 
@@ -64,9 +107,23 @@ value without brackets, or drop the brackets from `auth.prefix`.
 A credential free of `[` and `]` cannot be re-formed this way: every span of a
 redacted response that overlaps a replacement without being contained in it
 includes the placeholder's `[` or `]`, so such a credential can only "appear"
-inside the constant placeholder text (a credential of `RED` is a substring of
-`[REDACTED]`, which reveals nothing about it). Bracket-free credentials are
-unaffected by this check.
+inside the constant placeholder text.
+
+That leaves one edge case, which is refused on the same path: **a credential
+that is itself a substring of the literal text `[REDACTED]`** — `RED`,
+`ACTED`, `DAC`, the whole placeholder, or the empty string. Such a credential
+appears verbatim in any redacted response that contains a replacement at all.
+The appearance carries no information about the credential, because the bytes
+come from a constant rather than from the upstream, but the guarantee "no
+injected credential appears in the response" would be false as stated. Airlock
+refuses the request instead of shipping the guarantee with a caveat: the
+request is answered `500`, the upstream is never contacted, and the log names
+the route and the reason but never the value. Bracket-free credentials of four
+characters or more are unaffected unless they are a run of `REDACTED`.
+
+Together the two conditions are exactly the precondition of the redaction
+proofs, and that they are is itself proved — see
+[Machine-Checked Proofs](#machine-checked-proofs).
 
 Redaction is also independent of how the upstream chunks its response. Both the
 plain and the SSE redactor hold back only the tail of the stream that could
@@ -74,11 +131,11 @@ still begin a credential, and replace longest match first, so the bytes the
 agent receives are the same whatever the chunk boundaries are. An agent cannot
 reveal a fragment of a credential by influencing the response framing.
 
-Both of these properties — that no bracket-free credential survives redaction,
-and that the output does not depend on the chunk boundaries — are proved
-mechanically. See [Machine-Checked Proofs](#machine-checked-proofs), which also
-states the one part of the credential constraint that `redactionSafe` does not
-enforce.
+Both of these properties — that no credential Airlock accepts survives
+redaction, and that the output does not depend on the chunk boundaries — are
+proved mechanically, as is the fact that `redactionSafe` enforces the whole
+credential constraint the first proof needs. See
+[Machine-Checked Proofs](#machine-checked-proofs).
 
 ## MCP Request Inspection
 
@@ -222,7 +279,7 @@ verified in CI by [`.github/workflows/formal.yml`](../.github/workflows/formal.y
 which installs a pinned, SHA-256-checked Dafny 4.11.0 and runs
 `dafny verify --verification-time-limit 60` over every file. Warnings are
 errors, so a file that verifies with a warning still fails the job. The whole
-suite is 248 proof obligations and takes about 20 seconds.
+suite is 259 proof obligations and takes about 20 seconds.
 
 Nothing in `formal/` is axiomatised and nothing is assumed away inside a proof:
 CI rejects the build if `{:axiom}` or an `assume` statement appears anywhere
@@ -255,7 +312,7 @@ The glob matcher:
 - **Collapsing consecutive `**` does not change what matches.** `collapseDoublestar` is an optimisation against exponential branching; it is proved to accept exactly the same language.
 - **The whole `matchPattern` composition** — `splitPath`, then `collapseDoublestar`, then the DP — equals the declarative semantics of the *uncollapsed* pattern under the caps.
 
-Redaction, under the credential constraint stated below:
+Redaction, for every credential `redactionSafe` accepts:
 
 - **A bracket-free secret cannot overlap the placeholder.** It contains no `[REDACTED]`, has no suffix that is a placeholder prefix, and no prefix that is a placeholder suffix — so a replacement cannot splice the secret back together across its own boundary.
 - **One pass removes every occurrence of its secret and creates none.**
@@ -263,6 +320,7 @@ Redaction, under the credential constraint stated below:
 - **No secret appears in the output of `redactAll`,** for any number of secrets in any order.
 - **Streamed redaction equals one-shot redaction, for every chunking.** The chunk list is universally quantified, so this covers every way the upstream could split the body, including splitting a secret byte by byte across reads. Two different chunkings of the same body give byte-identical output.
 - **No secret appears in the streamed output, for every chunking** — the previous two results composed.
+- **The credential constraint those results need is enforced by `redactionSafe`, not assumed.** The theorems above have one hypothesis, `RedactableTok`: the secret is nonempty, contains no `[` or `]`, and is not a substring of `[REDACTED]`. The model of the shipped `redactionSafe` is proved to imply it for every secret it accepts (`RedactionSafeImpliesRedactable` in `formal/redact.dfy`), so the whole-buffer and streaming guarantees hold with `redactionSafe` as their only hypothesis (`NoSecretSurvivesTheShippedCheck`, `NoStreamedSecretSurvivesTheShippedCheck`). The converse is proved too, so the check refuses no credential the theorems could have covered.
 
 ### No rules means no restrictions
 
@@ -280,12 +338,12 @@ running binary:
 
 - **The models are hand-written transliterations of the Go, not generated from it.** No `dafny translate` output ships. The link is `internal/proxy/formal_diff_test.go`, which compares the shipped `splitPath`, `collapseDoublestar`, `matchSegment`, `matchPattern`, `AccessPolicy.Allowed`, `redactAll`, `tokenPrefixSuffixLen` and `streamRedactor` against hand-written Go reference implementations that mirror each Dafny definition line for line, over edge cases plus seeded pseudo-random input. It runs under `go test -race ./...`. A change to either side that breaks the correspondence fails that test, but the correspondence is checked by testing, not proved.
 - **`splitPath`'s use of the standard library is discharged by test, not proof.** The model splits on every `/` and drops empty pieces; the shipped code calls `strings.Trim` then `strings.Split` then filters. These are equal because `Trim` only removes leading and trailing `/`, each of which contributes an empty piece that the filter drops — an argument about the standard library, checked by `TestSplitPathMatchesDafnySplitPath`.
-- **The credential constraint includes one condition `redactionSafe` does not enforce.** The redaction theorems assume a secret is nonempty, free of `[` and `]`, **and not itself a substring of the literal text `[REDACTED]`**. `redactionSafe` enforces the brackets; it does not reject a credential like `RED` or `ACTED`. Such a credential does "appear" in redacted output, but only as part of the constant placeholder text, which carries no information about it. This is the same argument made in [Credential Characters and Redaction](#credential-characters-and-redaction), and it is an argument, not a theorem.
+- **`redactionSafe`'s use of the standard library is discharged by test, not proof.** The model of the check is `!ContainsAnyMeta(s) && !Occurs(PH, s)`; the shipped code calls `strings.ContainsAny(s, "[]")` then `strings.Contains("[REDACTED]", s)`. That these agree — including that `strings.Contains(x, "")` is true, which is what rejects the empty credential — is an argument about the standard library, checked by `TestRedactionSafeMatchesDafnyRedactionSafe` and `TestRedactionSafeDischargesRedactableTok`. The credential constraint itself is no longer assumed: see the last bullet under [What is proved](#what-is-proved).
 - **`path_regex` semantics are not modelled.** The per-rule matcher is uninterpreted, which is why first-match-wins, implicit deny and the segment cap cover regex rules too. But RE2's own behaviour, the `\A(?:...)\z` anchoring wrapper, and `normalizePath` are outside the models. The anchoring argument is in [Regex Path Matching](#regex-path-matching-path_regex) and is covered by tests and fuzzing, not proofs.
 - **The reader plumbing is not modelled.** The proofs cover the redaction algebra: the cascade receives some partition of its input followed by exactly one flush. That both shipped readers do deliver such a partition — `redactingReader` pushing `buf[:n]` per `Read` and flushing once when the upstream ends, `sseEventReader` calling the transform per event batch and the final hook once in `drain()` — is read off the code, not proved. Buffering, error ordering and `Close` behaviour are covered by tests only.
 - **SSE line-ending normalization happens before redaction.** `\r\n` and lone `\r` become `\n` on the way into the cascade, so the streaming guarantee is about the normalized byte stream, which is what the agent receives.
 - **`prepareRedactTokens`' ordering and deduplication are not modelled.** Neither theorem needs them: both hold for any token order, and the streaming and one-shot sides are always handed the same list. Longest-first ordering is a quality-of-redaction choice, not a safety property here.
-- **Alphabet.** Dafny `string` is a sequence of characters; the redactors operate on `[]byte`. The redaction proofs never inspect an element except to compare it with `[` or `]`, so they hold over sequences of any element type with those two values distinguished, and both brackets are single-byte ASCII. The same applies to `/` in the path model.
+- **Alphabet.** Dafny `string` is a sequence of characters; the redactors operate on `[]byte`. The redaction proofs never inspect an element except to compare it with `[`, with `]`, or with a character of the constant `[REDACTED]`, so they hold over sequences of any element type with those values distinguished, and every one of them is single-byte ASCII. That is also why the byte-level `strings.ContainsAny(s, "[]")` and `strings.Contains("[REDACTED]", s)` agree with the character-level model: the haystacks are pure ASCII, which is self-synchronizing in UTF-8, so no multi-byte character can match across a boundary. The reference implementations in `formal_diff_test.go` are byte-based, which is the side that ties the model to the shipped code. The same applies to `/` in the path model.
 - **Performance is not proved.** The DP is proved correct and terminating, not O(P×S).
 - **The toolchain is trusted.** Dafny 4.11.0 and its bundled Z3 are assumed sound; the release archive is pinned by SHA-256 but the proof checker itself is trusted.
 
@@ -297,6 +355,6 @@ running binary:
 | `403` | Access rule or MCP tool policy denied the request |
 | `404` | No route matched the request path |
 | `429` | Rate limit exceeded |
-| `500` | A credential could not be injected, or contains `[`/`]` and cannot be redacted |
+| `500` | A credential could not be injected (including a failed OAuth2 refresh), or cannot be redacted because it contains `[`/`]` or is a substring of `[REDACTED]` |
 | `502` | Upstream returned an error or is unreachable |
 | `504` | Request or idle timeout exceeded |

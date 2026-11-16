@@ -7,7 +7,7 @@
 //   redactedPlaceholder   -> PH
 //   bytes.ReplaceAll      -> ReplaceAll
 //   redactAll             -> OneShot
-//   redactionSafe         -> BracketFree / RedactableTokens
+//   redactionSafe         -> RedactionSafe
 //
 // What is proved here:
 //
@@ -23,12 +23,18 @@
 //       buffer, NONE of the secrets occurs in the output
 //       (OneShotRemovesAll). R1+R2 compose to give this for any number
 //       of secrets in any order.
+//   R4  THE PRECONDITION IS DISCHARGED BY THE SHIPPED CHECK: the model
+//       of redactionSafe implies RedactableTok for every secret it
+//       accepts (RedactionSafeImpliesRedactable), so R1-R3 apply to
+//       every redaction set the router lets through
+//       (NoSecretSurvivesTheShippedCheck). Nothing about the credential
+//       is left assumed.
 //
-// The documented credential constraint is RedactableTok below:
-// nonempty, free of '[' and ']' (which redactionSafe enforces before the
-// upstream is contacted), and not itself a substring of the constant
-// text "[REDACTED]". The last conjunct is NOT enforced by the Go code
-// and is a genuine assumption -- see docs/security.md, "What is assumed".
+// The credential constraint is RedactableTok below: nonempty, free of
+// '[' and ']', and not itself a substring of the constant text
+// "[REDACTED]". All three conjuncts are enforced by redactionSafe
+// before the upstream is contacted, and R4 proves that they are. A
+// credential failing any of them is refused with a 500.
 //
 // Nothing in this file is axiomatised and nothing is taken on trust by
 // the verifier: every lemma below has a proof. The earlier axiomatised
@@ -46,21 +52,51 @@ ghost predicate Occurs(hay: string, needle: string)
 predicate IsPrefix(w: string, s: string)
 { |w| <= |s| && s[..|w|] == w }
 
-// Go: redactionSafe rejects a secret containing any byte of
-// placeholderMeta == "[]".
+// The negation of the first thing redactionSafe rejects: a secret
+// containing any byte of placeholderMeta == "[]".
 predicate BracketFree(t: string)
 { forall i :: 0 <= i < |t| ==> t[i] != '[' && t[i] != ']' }
 
-// The documented constraint on a redactable credential.
+// The constraint on a redactable credential. Every conjunct is enforced
+// by redactionSafe -- see RedactionSafe and R4 below.
 ghost predicate RedactableTok(t: string)
 {
   && |t| > 0
-  && BracketFree(t)       // enforced by redactionSafe before any upstream call
-  && !Occurs(PH, t)       // t is not a substring of "[REDACTED]" (assumed)
+  && BracketFree(t)       // no '[' or ']'
+  && !Occurs(PH, t)       // t is not a substring of "[REDACTED]"
 }
 
 ghost predicate RedactableTokens(toks: seq<string>)
 { forall i :: 0 <= i < |toks| ==> RedactableTok(toks[i]) }
+
+// ---------------------------------------------------------------------
+// MODEL OF THE SHIPPED CHECK (Go: redactionSafe, internal/proxy/redact.go)
+//
+//   for _, s := range secrets {
+//       if strings.ContainsAny(s, placeholderMeta) { return false }
+//       if strings.Contains(placeholderText, s)   { return false }
+//   }
+//   return true
+//
+// with placeholderMeta == "[]" and placeholderText == PH.
+// ---------------------------------------------------------------------
+
+// Go: strings.ContainsAny(t, "[]").
+ghost predicate ContainsAnyMeta(t: string)
+{ exists i :: 0 <= i < |t| && (t[i] == '[' || t[i] == ']') }
+
+// Go: strings.Contains(placeholderText, t) -- t occurs somewhere in the
+// placeholder text. Note strings.Contains(x, "") is true, so this is
+// also what refuses the empty secret.
+ghost predicate SubstringOfPlaceholder(t: string)
+{ Occurs(PH, t) }
+
+// Go: redactionSafe(secrets).
+ghost predicate RedactionSafe(secrets: seq<string>)
+{
+  forall i :: 0 <= i < |secrets| ==>
+    !ContainsAnyMeta(secrets[i]) && !SubstringOfPlaceholder(secrets[i])
+}
 
 // ---------------------------------------------------------------------
 // Leftmost-first, non-overlapping replacement. This is bytes.ReplaceAll's
@@ -421,4 +457,105 @@ lemma NoSecretInOneShotOutput(s: string, toks: seq<string>)
   forall i | 0 <= i < |toks|
     ensures !Occurs(OneShot(s, toks), toks[i])
   { OneShotRemovesAll(s, toks, i); }
+}
+
+// =====================================================================
+// R4: THE PRECONDITION OF R1-R3 IS DISCHARGED BY THE SHIPPED CHECK.
+//
+// Everything above is stated under RedactableTok. This section proves
+// that RedactableTok holds for every secret redactionSafe accepts, so
+// the guarantee applies to every redaction set the router forwards and
+// nothing about the credential is left assumed.
+//
+// The two Go conditions line up with the two interesting conjuncts:
+// ContainsAnyMeta is the negation of BracketFree, and
+// SubstringOfPlaceholder is Occurs(PH, t). Nonemptiness is not a third
+// check: the empty string occurs in PH at index 0, so the substring
+// condition already rejects it, which is exactly what
+// strings.Contains(placeholderText, "") == true does in Go.
+// =====================================================================
+
+// ContainsAnyMeta is the negation of BracketFree. Two spellings of one
+// condition: Go tests for the presence of a bracket, the proofs above
+// require its absence.
+lemma ContainsAnyMetaIsNotBracketFree(t: string)
+  ensures ContainsAnyMeta(t) <==> !BracketFree(t)
+{
+  if ContainsAnyMeta(t) {
+    var i :| 0 <= i < |t| && (t[i] == '[' || t[i] == ']');
+  }
+  if !BracketFree(t) {
+    var i :| 0 <= i < |t| && !(t[i] != '[' && t[i] != ']');
+    assert 0 <= i < |t| && (t[i] == '[' || t[i] == ']');
+  }
+}
+
+// The empty string is a substring of the placeholder, so the substring
+// condition rejects it. This is the conjunct that used to be carried by
+// RedactableTok's |t| > 0 with no corresponding check in the Go: the
+// rejection is stated here as well as the substring fact, so nothing is
+// left to a comment.
+lemma EmptyIsSubstringOfPlaceholder()
+  ensures SubstringOfPlaceholder("")
+  ensures !RedactionSafe([""])
+{
+  assert OccursAt(PH, "", 0) by { assert PH[0..0] == ""; }
+  assert [""][0] == "";
+}
+
+// R4, the implication the spec asks for:
+//
+//     redactionSafe(secrets) ==> forall t in secrets :: RedactableTok(t)
+lemma RedactionSafeImpliesRedactable(secrets: seq<string>)
+  requires RedactionSafe(secrets)
+  ensures RedactableTokens(secrets)
+  ensures forall i :: 0 <= i < |secrets| ==> |secrets[i]| > 0
+{
+  forall i | 0 <= i < |secrets|
+    ensures RedactableTok(secrets[i])
+  {
+    var t := secrets[i];
+    ContainsAnyMetaIsNotBracketFree(t);
+    assert BracketFree(t);
+    assert !Occurs(PH, t);
+    if |t| == 0 {
+      EmptyIsSubstringOfPlaceholder();
+      assert t == "";
+      assert false;
+    }
+  }
+}
+
+// The converse direction, for completeness: the check is not stronger
+// than the constraint either, so RedactionSafe and RedactableTokens are
+// equivalent and the check rejects no credential that satisfies the
+// theorems' precondition.
+//
+// This is a statement about RedactableTok, not about re-spellability in
+// general. The bracket rule is deliberately conservative: it refuses
+// some credentials, such as "X]]", that no body could actually re-form.
+// Narrowing it is not worth the proof it would cost.
+lemma RedactableImpliesRedactionSafe(secrets: seq<string>)
+  requires RedactableTokens(secrets)
+  ensures RedactionSafe(secrets)
+{
+  forall i | 0 <= i < |secrets|
+    ensures !ContainsAnyMeta(secrets[i]) && !SubstringOfPlaceholder(secrets[i])
+  { ContainsAnyMetaIsNotBracketFree(secrets[i]); }
+}
+
+// =====================================================================
+// R3 restated over the shipped check: no secret the router accepted can
+// appear in the output of redactAll. This is R4 composed with R3 and is
+// the end-to-end whole-buffer guarantee with no remaining hypothesis
+// about the credential beyond what the gateway itself enforces.
+// =====================================================================
+lemma NoSecretSurvivesTheShippedCheck(s: string, toks: seq<string>)
+  requires RedactionSafe(toks)
+  ensures RedactableTokens(toks)
+  ensures forall i :: 0 <= i < |toks| ==> |toks[i]| > 0
+  ensures forall i :: 0 <= i < |toks| ==> !Occurs(OneShot(s, toks), toks[i])
+{
+  RedactionSafeImpliesRedactable(toks);
+  NoSecretInOneShotOutput(s, toks);
 }

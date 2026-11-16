@@ -142,6 +142,55 @@ func refBracketFree(t []byte) bool {
 	return true
 }
 
+// refContainsAnyMeta mirrors Dafny ContainsAnyMeta (formal/redact.dfy).
+func refContainsAnyMeta(t []byte) bool {
+	for _, c := range t {
+		if c == '[' || c == ']' {
+			return true
+		}
+	}
+	return false
+}
+
+// refOccursAt mirrors Dafny OccursAt (formal/redact.dfy).
+func refOccursAt(hay, needle []byte, i int) bool {
+	return i+len(needle) <= len(hay) && bytes.Equal(hay[i:i+len(needle)], needle)
+}
+
+// refOccurs mirrors Dafny Occurs (formal/redact.dfy). The existential is
+// bounded by |hay|, so it is decided by a scan.
+func refOccurs(hay, needle []byte) bool {
+	for i := 0; i <= len(hay); i++ {
+		if refOccursAt(hay, needle, i) {
+			return true
+		}
+	}
+	return false
+}
+
+// refSubstringOfPlaceholder mirrors Dafny SubstringOfPlaceholder
+// (formal/redact.dfy): Occurs(PH, t).
+func refSubstringOfPlaceholder(t []byte) bool {
+	return refOccurs(refPH, t)
+}
+
+// refRedactionSafe mirrors Dafny RedactionSafe (formal/redact.dfy), the
+// model of the shipped redactionSafe.
+func refRedactionSafe(secrets []string) bool {
+	for _, s := range secrets {
+		if refContainsAnyMeta([]byte(s)) || refSubstringOfPlaceholder([]byte(s)) {
+			return false
+		}
+	}
+	return true
+}
+
+// refRedactableTok mirrors Dafny RedactableTok (formal/redact.dfy), the
+// precondition of the redaction theorems.
+func refRedactableTok(t []byte) bool {
+	return len(t) > 0 && refBracketFree(t) && !refOccurs(refPH, t)
+}
+
 // refReplaceAll mirrors Dafny ReplaceAll (formal/redact.dfy): leftmost
 // first, non-overlapping, one character at a time.
 func refReplaceAll(s, pat, nw []byte) []byte {
@@ -678,23 +727,20 @@ func TestStreamedRedactionEqualsOneShot(t *testing.T) {
 	}
 }
 
-// S2 / R3 on real data: no secret survives, under the documented
-// constraint (bracket-free and not a substring of "[REDACTED]").
+// S2 / R3 on real data: no secret survives. redactionSafe is the only
+// filter, because it now enforces the whole credential constraint --
+// bracket-free AND not a substring of "[REDACTED]" -- so there is no
+// second skip condition to apply here.
 func TestNoSecretSurvivesRedaction(t *testing.T) {
 	rng := rand.New(rand.NewSource(1005))
 	for _, secrets := range formalSecretCorpus() {
-		// The documented credential constraint.
+		// The credential constraint, enforced exactly by the shipped check.
 		if !redactionSafe(secrets) {
 			continue
 		}
-		skip := false
 		for _, s := range secrets {
-			if bytes.Contains(refPH, []byte(s)) {
-				skip = true // a substring of the placeholder text itself
-			}
-		}
-		if skip {
-			continue
+			require.True(t, refRedactableTok([]byte(s)),
+				"redactionSafe accepted %q, so RedactableTok must hold", s)
 		}
 		toks := prepareRedactTokens(secrets)
 		require.NotNil(t, toks)
@@ -722,14 +768,111 @@ func TestNoSecretSurvivesRedaction(t *testing.T) {
 	}
 }
 
-// redactionSafe is exactly Dafny BracketFree over the secret list.
-func TestRedactionSafeMatchesDafnyBracketFree(t *testing.T) {
+// redactionSafe is exactly Dafny RedactionSafe over the secret list:
+// no '[' or ']' (ContainsAnyMeta) and not a substring of the placeholder
+// text (SubstringOfPlaceholder).
+func TestRedactionSafeMatchesDafnyRedactionSafe(t *testing.T) {
 	cands := []string{
 		"", "a", "sk-abc", "[", "]", "[]", "a[b", "a]b", "[REDACTED]",
 		"REDACTED", "\x00", "a\x00b",
+		// Substrings of the placeholder text, which the second condition
+		// is what rejects.
+		"R", "RE", "DACT", "ED", "ACTED", "EDACTED", "[RED", "TED]",
+		// Near misses that are not substrings of it.
+		"REDACTEDX", "REDCTED", "ED ", "RD", "DE", "redacted",
 	}
 	for _, s := range cands {
-		assert.Equal(t, refBracketFree([]byte(s)), redactionSafe([]string{s}),
+		assert.Equal(t, refRedactionSafe([]string{s}), redactionSafe([]string{s}),
 			"redactionSafe(%q)", s)
 	}
+
+	// Over a secret list, both sides reject if any single element is
+	// rejected.
+	lists := [][]string{
+		nil,
+		{},
+		{"sk-abc", "Bearer sk-abc"},
+		{"sk-abc", "ED"},
+		{"ED", "sk-abc"},
+		{"sk-abc", ""},
+		{"sk-abc", "a]b"},
+	}
+	for _, l := range lists {
+		assert.Equal(t, refRedactionSafe(l), redactionSafe(l),
+			"redactionSafe(%q)", l)
+	}
+}
+
+// Every contiguous substring of the placeholder text is refused, and the
+// empty string with it. The placeholder is 10 bytes, so this is the 66
+// (i, j) spans with i <= j: an explicit, closed bound.
+func TestRedactionSafeRefusesEveryPlaceholderSubstring(t *testing.T) {
+	ph := string(redactedPlaceholder)
+	require.Len(t, ph, 10)
+	checked := 0
+	for i := 0; i <= len(ph); i++ {
+		for j := i; j <= len(ph); j++ {
+			sub := ph[i:j]
+			checked++
+			assert.False(t, redactionSafe([]string{sub}),
+				"a secret of %q is a substring of %q and must be refused", sub, ph)
+			assert.False(t, refRedactableTok([]byte(sub)),
+				"RedactableTok(%q) must be false", sub)
+			// And refused in company, whichever side it sits on.
+			assert.False(t, redactionSafe([]string{"sk-ordinary", sub}))
+			assert.False(t, redactionSafe([]string{sub, "sk-ordinary"}))
+		}
+	}
+	assert.Equal(t, 66, checked, "all i <= j pairs over a 10-byte placeholder")
+}
+
+// R4 on real data: everything redactionSafe accepts satisfies
+// RedactableTok, the precondition of the redaction theorems. This is the
+// Go-side witness of RedactionSafeImpliesRedactable in formal/redact.dfy.
+//
+// The sweep is bounded and streamed: a 5-character alphabet chosen to hit
+// both conditions, lengths 0 to 3, generated one candidate at a time and
+// never collected. 5^0+5^1+5^2+5^3 = 156 candidates.
+func TestRedactionSafeDischargesRedactableTok(t *testing.T) {
+	const alphabet = "R[D]E"
+	const maxLen = 3
+
+	accepted, rejected := 0, 0
+	check := func(s string) {
+		safe := redactionSafe([]string{s})
+		// The shipped check and the Dafny model agree.
+		require.Equal(t, refRedactionSafe([]string{s}), safe,
+			"redactionSafe(%q) must match the model", s)
+		if safe {
+			accepted++
+			// R4: acceptance implies the theorems' precondition.
+			require.True(t, refRedactableTok([]byte(s)),
+				"redactionSafe accepted %q but RedactableTok(%q) is false", s, s)
+		} else {
+			rejected++
+			require.False(t, refRedactableTok([]byte(s)),
+				"redactionSafe rejected %q but RedactableTok(%q) is true", s, s)
+		}
+	}
+
+	// Stream the candidates: an odometer over the alphabet, one string in
+	// flight at a time, no collection of the whole space.
+	buf := make([]byte, 0, maxLen)
+	var walk func(depth int)
+	walk = func(depth int) {
+		check(string(buf))
+		if depth == maxLen {
+			return
+		}
+		for i := 0; i < len(alphabet); i++ {
+			buf = append(buf, alphabet[i])
+			walk(depth + 1)
+			buf = buf[:len(buf)-1]
+		}
+	}
+	walk(0)
+
+	assert.Equal(t, 156, accepted+rejected, "bounded sweep size")
+	assert.Positive(t, accepted, "the sweep must exercise the accepting side")
+	assert.Positive(t, rejected, "the sweep must exercise the rejecting side")
 }
